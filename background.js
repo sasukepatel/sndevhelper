@@ -5,11 +5,14 @@
  */
 
 chrome.commands.onCommand.addListener(async (command) => {
-  if (command !== "toggle-field-names") return;
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab || !/\.service-now\.com/.test(tab.url || "")) return;
-  // Sent to all frames; the gsft_main frame's content script handles the DOM.
-  chrome.tabs.sendMessage(tab.id, { type: "TOGGLE_FIELD_NAMES" }).catch(() => {});
+
+  if (command === "open-palette") {
+    chrome.tabs.sendMessage(tab.id, { type: "OPEN_PALETTE" }).catch(() => {});
+  } else if (command === "toggle-field-names") {
+    chrome.tabs.sendMessage(tab.id, { type: "TOGGLE_FIELD_NAMES" }).catch(() => {});
+  }
 });
 
 // Content scripts can't call chrome.tabs.create; they ask us via OPEN_URL.

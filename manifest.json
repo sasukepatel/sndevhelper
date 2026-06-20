@@ -21,6 +21,10 @@
     }
   ],
   "commands": {
+    "open-palette": {
+      "suggested_key": { "default": "Ctrl+Slash" },
+      "description": "Open SN Dev Helper command palette"
+    },
     "toggle-field-names": {
       "suggested_key": { "default": "Alt+Shift+F" },
       "description": "Toggle technical field names on the current form"

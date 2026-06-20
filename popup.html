@@ -16,25 +16,8 @@
       <div class="muted">Detecting instance…</div>
     </section>
 
-    <section class="card">
-      <label class="field-label" for="jump">Open table</label>
-      <div class="row">
-        <input id="jump" type="text" placeholder="incident, sys_script, cmdb_ci…" autocomplete="off" />
-        <button id="jumpList" title="Open list">List</button>
-        <button id="jumpNew" title="Open new record" class="ghost">New</button>
-      </div>
-      <div class="hint">Enter = list. Tip: type a sys_id with a table to open the record.</div>
-    </section>
-
-    <section class="card">
-      <div class="field-label">Quick dev links</div>
-      <div class="links" id="links"></div>
-    </section>
-
-    <section class="card actions">
-      <button id="copySysId">Copy current sys_id</button>
-      <button id="toggleFields" class="ghost">Toggle field names <kbd>Alt+Shift+F</kbd></button>
-      <button id="toggleTranslations" class="ghost">Toggle translation icons</button>
+    <section class="card shortcut-hint">
+      <span class="hint-key">Ctrl+/</span> to open command palette on this tab
     </section>
 
     <footer><span id="toast"></span></footer>
