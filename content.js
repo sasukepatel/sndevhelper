@@ -11,7 +11,7 @@
  * with world:"MAIN". Here we only touch the DOM.
  */
 
-const SNH = { fieldNamesOn: false, transIconsOn: false };
+const SNH = { fieldNamesOn: false, transIconsOn: false, lastPrefillVariables: [] };
 const SNH_FRAME_COMMAND_SOURCE = "SN_DEV_HELPER_FRAME_COMMAND";
 const WORKSPACE_FIELD_ATTRS = [
   "data-field-name",
@@ -346,6 +346,432 @@ async function snGet(table, query, fields) {
   return (data && data.result) || [];
 }
 
+async function snGetMany(table, query, fields, limit, options) {
+  const resp = await chrome.runtime.sendMessage({
+    type: "SN_TABLE_GET",
+    table,
+    query,
+    fields,
+    limit: limit || 200,
+    options: options || {},
+  });
+  if (!resp || !resp.ok) {
+    throw new Error((resp && resp.error) || "Couldn't read " + table);
+  }
+  return resp.result || [];
+}
+
+function snFieldValue(row, field) {
+  const raw = row && row[field];
+  if (raw == null) return "";
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    if (raw.value != null) return String(raw.value);
+    if (raw.display_value != null) return String(raw.display_value);
+    return "";
+  }
+  return String(raw);
+}
+
+function snFieldDisplay(row, field) {
+  const raw = row && row[field];
+  if (raw == null) return "";
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    if (raw.display_value != null) return String(raw.display_value);
+    if (raw.value != null) return String(raw.value);
+    return "";
+  }
+  return String(raw);
+}
+
+function isEmptyPrefillValue(value) {
+  return value == null || String(value).trim() === "";
+}
+
+function isSysId(value) {
+  return /^[0-9a-f]{32}$/i.test(String(value || ""));
+}
+
+function normalizeSourceInput(input) {
+  const text = String(input || "").trim();
+  const sysId = sysIdFromText(text) || (/^[0-9a-f]{32}$/i.test(text) ? text : null);
+  if (sysId) return { kind: "sys_id", value: sysId.toLowerCase() };
+
+  const ticketMatch = text.match(/[A-Za-z][A-Za-z0-9_-]*\d[A-Za-z0-9_-]*/);
+  const value = (ticketMatch ? ticketMatch[0] : text).replace(/\^/g, "").trim();
+  return { kind: "number", value };
+}
+
+async function resolveVariableSource(input) {
+  const parsed = normalizeSourceInput(input);
+  if (!parsed.value) throw new Error("Enter a ticket number or sys_id.");
+
+  const taskQuery =
+    parsed.kind === "sys_id"
+      ? "sys_id=" + parsed.value
+      : "number=" + parsed.value;
+  const taskRows = await snGetMany(
+    "task",
+    taskQuery,
+    "sys_id,number,sys_class_name",
+    2
+  );
+  const task = taskRows[0];
+
+  if (!task) {
+    if (parsed.kind === "sys_id") {
+      return {
+        mode: "producer",
+        sysId: parsed.value,
+        table: null,
+        number: null,
+        requestItemId: null,
+      };
+    }
+    throw new Error("No task found for " + parsed.value + ".");
+  }
+
+  const sysId = snFieldValue(task, "sys_id");
+  const table = snFieldValue(task, "sys_class_name");
+  const number = snFieldValue(task, "number");
+
+  if (table === "sc_req_item") {
+    return { mode: "catalog", sysId, table, number, requestItemId: sysId };
+  }
+
+  if (table === "sc_task") {
+    const taskDetails = await snGetMany("sc_task", "sys_id=" + sysId, "request_item", 1);
+    const requestItemId = snFieldValue(taskDetails[0], "request_item");
+    if (!requestItemId) throw new Error("Catalog task has no request item.");
+    return { mode: "catalog", sysId, table, number, requestItemId };
+  }
+
+  if (table === "sc_request") {
+    const ritms = await snGetMany(
+      "sc_req_item",
+      "request=" + sysId,
+      "sys_id,number",
+      10
+    );
+    if (ritms.length === 1) {
+      return {
+        mode: "catalog",
+        sysId,
+        table,
+        number,
+        requestItemId: snFieldValue(ritms[0], "sys_id"),
+      };
+    }
+    if (ritms.length > 1) {
+      throw new Error("REQ has " + ritms.length + " items. Paste a specific RITM.");
+    }
+    throw new Error("REQ has no requested items.");
+  }
+
+  return { mode: "producer", sysId, table, number, requestItemId: null };
+}
+
+const UNSUPPORTED_VARIABLE_TYPES = new Set([
+  "11",
+  "14",
+  "15",
+  "17",
+  "19",
+  "20",
+  "21",
+  "24",
+  "25",
+  "31",
+  "33",
+  "attachment",
+  "container",
+  "container_end",
+  "container_start",
+  "encrypted",
+  "label",
+  "list_collector",
+  "macro",
+  "multi_row",
+  "multi_row_variable_set",
+  "password",
+  "rich_text_label",
+]);
+
+function isUnsupportedVariableType(type) {
+  const normalized = String(type || "").trim().toLowerCase().replace(/\s+/g, "_");
+  return normalized && UNSUPPORTED_VARIABLE_TYPES.has(normalized);
+}
+
+function normalizeSourceVariable(row, mapping) {
+  const name = snFieldValue(row, mapping.name).trim();
+  const value = snFieldValue(row, mapping.value);
+  if (!name || isEmptyPrefillValue(value)) return { variable: null, skipped: 0 };
+
+  const type = snFieldValue(row, mapping.type);
+  if (isUnsupportedVariableType(type)) return { variable: null, skipped: 1 };
+
+  return {
+    variable: {
+      name,
+      label: snFieldDisplay(row, mapping.label),
+      type,
+      value,
+      displayValue: snFieldDisplay(row, mapping.value),
+      questionId: mapping.questionId ? snFieldValue(row, mapping.questionId) : "",
+      referenceTable:
+        (mapping.referenceTable ? snFieldValue(row, mapping.referenceTable) : "") ||
+        (mapping.lookupTable ? snFieldValue(row, mapping.lookupTable) : ""),
+    },
+    skipped: 0,
+  };
+}
+
+function addVariablesFromRows(target, rows, mapping) {
+  let skipped = 0;
+  rows.forEach((row) => {
+    const normalized = normalizeSourceVariable(row, mapping);
+    skipped += normalized.skipped;
+    if (!normalized.variable) return;
+    if (!target.has(normalized.variable.name)) {
+      target.set(normalized.variable.name, normalized.variable);
+    }
+  });
+  return skipped;
+}
+
+async function fetchCatalogVariables(requestItemId) {
+  const rows = await snGetMany(
+    "sc_item_option_mtom",
+    "request_item=" + requestItemId,
+    [
+      "sc_item_option.value",
+      "sc_item_option.item_option_new",
+      "sc_item_option.item_option_new.name",
+      "sc_item_option.item_option_new.question_text",
+      "sc_item_option.item_option_new.type",
+      "sc_item_option.item_option_new.reference",
+      "sc_item_option.item_option_new.lookup_table",
+    ].join(","),
+    300,
+    { displayAll: true, excludeRefLinks: true }
+  );
+  const variables = new Map();
+  const skipped = addVariablesFromRows(variables, rows, {
+    name: "sc_item_option.item_option_new.name",
+    label: "sc_item_option.item_option_new.question_text",
+    type: "sc_item_option.item_option_new.type",
+    value: "sc_item_option.value",
+    questionId: "sc_item_option.item_option_new",
+    referenceTable: "sc_item_option.item_option_new.reference",
+    lookupTable: "sc_item_option.item_option_new.lookup_table",
+  });
+  return { variables, skipped };
+}
+
+async function fetchProducerVariables(sysId) {
+  const fields = [
+    "value",
+    "question",
+    "question.name",
+    "question.question_text",
+    "question.type",
+    "question.reference",
+    "question.lookup_table",
+  ].join(",");
+  const queries = ["document=" + sysId, "table_sys_id=" + sysId];
+  const variables = new Map();
+  let skipped = 0;
+  let readAny = false;
+
+  for (const query of queries) {
+    try {
+      const rows = await snGetMany("question_answer", query, fields, 300, {
+        displayAll: true,
+        excludeRefLinks: true,
+      });
+      if (!rows.length) continue;
+      readAny = true;
+      skipped += addVariablesFromRows(variables, rows, {
+        name: "question.name",
+        label: "question.question_text",
+        type: "question.type",
+        value: "value",
+        questionId: "question",
+        referenceTable: "question.reference",
+        lookupTable: "question.lookup_table",
+      });
+      break;
+    } catch (e) {
+      /* Some instances use only one of these key fields. Try the next shape. */
+    }
+  }
+
+  return { variables, skipped, readAny };
+}
+
+function isReferenceVariable(variable) {
+  const type = String((variable && variable.type) || "").trim().toLowerCase();
+  return type === "8" || type === "reference";
+}
+
+function bestDisplayValue(row) {
+  const displayFields = [
+    "name",
+    "number",
+    "display_name",
+    "title",
+    "short_description",
+    "u_name",
+    "street",
+  ];
+  for (const field of displayFields) {
+    const value = snFieldDisplay(row, field);
+    if (value && !isSysId(value)) return value;
+  }
+
+  const locationParts = ["street", "city", "state"].map((field) => snFieldDisplay(row, field)).filter(Boolean);
+  if (locationParts.length) return locationParts.join(", ");
+
+  return "";
+}
+
+async function resolveReferenceDisplayValues(variables) {
+  for (const variable of variables.values()) {
+    if (!isReferenceVariable(variable) || !isSysId(variable.value)) continue;
+    if (variable.displayValue && variable.displayValue !== variable.value && !isSysId(variable.displayValue)) {
+      continue;
+    }
+
+    const table = variable.referenceTable || "";
+    if (!table) continue;
+
+    try {
+      const rows = await snGetMany(
+        table,
+        "sys_id=" + variable.value,
+        "sys_id,name,number,display_name,title,short_description,u_name,street,city,state",
+        1,
+        { displayAll: true, excludeRefLinks: true }
+      );
+      if (!rows.length) continue;
+      const display = bestDisplayValue(rows[0]);
+      if (display) variable.displayValue = display;
+    } catch (e) {
+      /* Keep the sys_id fallback if reference display lookup is blocked. */
+    }
+  }
+}
+
+async function fetchSourceVariables(source) {
+  const variables = new Map();
+  let skipped = 0;
+  let hadReadError = false;
+
+  if (source.mode === "catalog" && source.requestItemId) {
+    try {
+      const catalog = await fetchCatalogVariables(source.requestItemId);
+      skipped += catalog.skipped;
+      catalog.variables.forEach((variable, name) => variables.set(name, variable));
+    } catch (e) {
+      hadReadError = true;
+    }
+  }
+
+  try {
+    const producer = await fetchProducerVariables(source.sysId);
+    skipped += producer.skipped;
+    producer.variables.forEach((variable, name) => {
+      if (!variables.has(name)) variables.set(name, variable);
+    });
+  } catch (e) {
+    if (source.mode === "producer") hadReadError = true;
+  }
+
+  if (!variables.size && hadReadError) {
+    throw new Error("Couldn't read variables. Check access to catalog variable tables.");
+  }
+
+  await resolveReferenceDisplayValues(variables);
+
+  return { variables: Array.from(variables.values()), skipped };
+}
+
+async function prefillPortalVariablesFromTicket(input) {
+  const value = String(input || "").trim();
+  if (!value) {
+    showToast("Enter a ticket number or sys_id", true);
+    return;
+  }
+
+  showToast("Reading variables...");
+  try {
+    const source = await resolveVariableSource(value);
+    const sourceResult = await fetchSourceVariables(source);
+    const variables = sourceResult.variables;
+    SNH.lastPrefillVariables = variables;
+    if (!variables.length) {
+      const suffix = sourceResult.skipped ? " (" + sourceResult.skipped + " unsupported)" : "";
+      showToast("No copyable variables found" + suffix, true);
+      return;
+    }
+
+    showToast("Filling portal form...");
+    const resp = await chrome.runtime.sendMessage({
+      type: "FILL_PORTAL_VARIABLES",
+      variables,
+    });
+
+    if (!resp || !resp.ok) {
+      throw new Error((resp && resp.error) || "Couldn't fill portal variables.");
+    }
+    if (!resp.foundForm) {
+      showToast("Open a catalog order form first", true);
+      return;
+    }
+
+    const skipped = (resp.skipped || 0) + (sourceResult.skipped || 0);
+    const already = resp.alreadySet || 0;
+    const unmatched = resp.unmatched || 0;
+    let message = "Filled " + (resp.filled || 0) + " of " + variables.length + " variables";
+    const details = [];
+    if (already) details.push(already + " already set");
+    if (unmatched) details.push(unmatched + " not on this form");
+    if (skipped) details.push(skipped + " skipped");
+    if (details.length) message += " (" + details.join(", ") + ")";
+    if (!resp.filled && unmatched === variables.length) {
+      message = "No matching variables on this form (" + unmatched + " not found)";
+    }
+    showToast(message);
+  } catch (error) {
+    showToast(String(error && error.message ? error.message : error), true);
+  }
+}
+
+async function copyPortalVariableDebugInfo() {
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: "GET_PORTAL_VARIABLE_DEBUG" });
+    if (!resp || !resp.ok) {
+      throw new Error((resp && resp.error) || "Couldn't inspect portal form.");
+    }
+    const report = {
+      url: location.href,
+      sourceVariables: SNH.lastPrefillVariables.map((variable) => ({
+        name: variable.name,
+        label: variable.label,
+        type: variable.type,
+        questionId: variable.questionId,
+        referenceTable: variable.referenceTable,
+        valueLength: variable.value ? String(variable.value).length : 0,
+        displayValue: variable.displayValue,
+      })),
+      frames: resp.frames || [],
+    };
+    await copyText(JSON.stringify(report, null, 2));
+    showToast("Copied portal variable debug info");
+  } catch (error) {
+    showToast(String(error && error.message ? error.message : error), true);
+  }
+}
+
 // Walk up the table hierarchy to find where the field's dictionary entry lives.
 async function resolveDefiningTable(startTable, field) {
   let table = startTable;
@@ -552,6 +978,24 @@ function buildCommands() {
           showToast("No record sys_id found", true);
         }
       },
+    },
+    {
+      id: "prefill-variables",
+      name: "Prefill variables from ticket...",
+      keywords: ["variable", "prefill", "copy", "ritm", "sctask", "req", "catalog", "portal", "clone"],
+      group: "Catalog",
+      input: true,
+      placeholder: "RITM/SCTASK/REQ/task number or sys_id",
+      keepOpen: true,
+      run: prefillPortalVariablesFromTicket,
+    },
+    {
+      id: "copy-portal-variable-debug",
+      name: "Copy portal variable debug info",
+      keywords: ["debug", "portal", "variable", "field", "dom", "g_form"],
+      group: "Catalog",
+      keepOpen: true,
+      run: copyPortalVariableDebugInfo,
     },
     {
       id: "open-table-list",
@@ -798,8 +1242,14 @@ function showArgInput(cmd) {
   argInput.focus();
   argInput.onkeydown = (e) => {
     if (e.key === "Enter") {
-      if (activeInputCmd) activeInputCmd.run(argInput.value.trim());
-      closePalette();
+      e.preventDefault();
+      const cmd = activeInputCmd;
+      const value = argInput.value.trim();
+      if (!cmd) return;
+      Promise.resolve(cmd.run(value)).catch((error) => {
+        showToast(String(error && error.message ? error.message : error), true);
+      });
+      if (!cmd.keepOpen) closePalette();
     }
     if (e.key === "Escape") {
       activeInputCmd = null;
