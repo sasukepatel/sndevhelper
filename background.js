@@ -80,7 +80,7 @@ function extractSysId() {
 async function tableApiGetInPage(request) {
   const params = new URLSearchParams();
   params.set("sysparm_query", request.query || "");
-  params.set("sysparm_fields", request.fields || "");
+  if (request.fields) params.set("sysparm_fields", request.fields);
   params.set("sysparm_limit", String(request.limit || 200));
   if (request.options && request.options.displayAll) {
     params.set("sysparm_display_value", "all");
@@ -115,7 +115,7 @@ async function tableApiGetInPage(request) {
   return { ok: true, result: (data && data.result) || [] };
 }
 
-function fillPortalVariables(variables) {
+async function fillPortalVariables(variables) {
   const result = {
     foundForm: false,
     filled: 0,
@@ -125,6 +125,23 @@ function fillPortalVariables(variables) {
     total: Array.isArray(variables) ? variables.length : 0,
   };
   const values = Array.isArray(variables) ? variables : [];
+  const simpleFillDelayMs = 75;
+  const choiceFillDelayMs = 300;
+  const referenceFillDelayMs = 900;
+  const triggerReferenceDelayMs = 2500;
+  const retryDelayMs = 500;
+  const maxFillPasses = 3;
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const emitProgress = (message) => {
+    try {
+      window.postMessage(
+        { source: "SN_DEV_HELPER_PREFILL_PROGRESS", message },
+        location.origin
+      );
+    } catch (e) {}
+  };
 
   const unsupportedTypes = new Set([
     "11",
@@ -170,20 +187,80 @@ function fillPortalVariables(variables) {
     typeof candidate.getValue === "function" &&
     typeof candidate.setValue === "function";
 
-  const findGFormInObject = (obj, depth, seen) => {
-    if (!obj || typeof obj !== "object" || depth > 3) return null;
+  const currentCatalogItemSysId = () => {
+    try {
+      const url = new URL(location.href);
+      const sysId = url.searchParams.get("sys_id");
+      if (sysId && /^[0-9a-f]{32}$/i.test(sysId)) return sysId;
+    } catch (e) {}
+
+    try {
+      const el = document.querySelector("[cat-item-sys-id],[data-item-sys-id],[data-sys-id]");
+      const sysId =
+        (el && (el.getAttribute("cat-item-sys-id") || el.getAttribute("data-item-sys-id") || el.getAttribute("data-sys-id"))) ||
+        "";
+      if (/^[0-9a-f]{32}$/i.test(sysId)) return sysId;
+    } catch (e) {}
+
+    return "";
+  };
+
+  const gFormSysId = (gForm) => {
+    try {
+      return typeof gForm.getSysId === "function" ? String(gForm.getSysId() || "") : "";
+    } catch (e) {
+      return "";
+    }
+  };
+
+  const scoreGForm = (gForm, scope, el, itemSysId, source) => {
+    if (!isGForm(gForm)) return -1;
+    let score = 0;
+    const sysId = gFormSysId(gForm);
+    if (source && source.indexOf("getGlideForm()") >= 0) score += 300;
+    if (source === "scope.page.g_form" || source === "scope.page.gForm") score += 250;
+    if (source === "scope.g_form" || source === "scope.gForm") score += 150;
+    if (itemSysId && sysId === itemSysId) score += 100;
+    if (sysId === "-1") score += 80;
+    if (!sysId) score += 10;
+
+    try {
+      if (scope && scope.c && typeof scope.c.getItemId === "function" && scope.c.getItemId() === itemSysId) {
+        score += 100;
+      }
+    } catch (e) {}
+    try {
+      if (scope && scope.data && scope.data.sc_cat_item && scope.data.sc_cat_item.sys_id === itemSysId) {
+        score += 80;
+      }
+    } catch (e) {}
+    try {
+      if (scope && scope.data && scope.data.sys_id === itemSysId) score += 40;
+    } catch (e) {}
+    try {
+      if (el && el.id === "sc_cat_item") score += 150;
+    } catch (e) {}
+    try {
+      if (el && el.matches && el.matches("sp-variable-layout,sp-cat-item,sp-sc-cat-item,.sc-form,.catalog-form,[sp-model]")) {
+        score += 25;
+      }
+    } catch (e) {}
+
+    return score;
+  };
+
+  const findGFormsInObject = (obj, depth, seen, found) => {
+    if (!obj || typeof obj !== "object" || depth > 3) return;
     if (seen.indexOf(obj) >= 0) return null;
     seen.push(obj);
-    if (isGForm(obj)) return obj;
+    if (isGForm(obj) && found.indexOf(obj) < 0) found.push(obj);
 
     const directKeys = ["g_form", "gForm", "page", "c", "data", "$parent"];
     for (const key of directKeys) {
       try {
-        const found = findGFormInObject(obj[key], depth + 1, seen);
-        if (found) return found;
+        findGFormsInObject(obj[key], depth + 1, seen, found);
       } catch (e) {}
     }
-    return null;
   };
 
   const getAngular = () => {
@@ -195,14 +272,55 @@ function fillPortalVariables(variables) {
   };
 
   const findPortalGForm = () => {
+    const itemSysId = currentCatalogItemSysId();
+    const candidates = [];
+    const addCandidate = (gForm, scope, el, source) => {
+      if (!isGForm(gForm)) return;
+      if (candidates.some((candidate) => candidate.gForm === gForm)) return;
+      candidates.push({
+        gForm,
+        score: scoreGForm(gForm, scope, el, itemSysId, source),
+        source,
+      });
+    };
+    const addScopeCandidates = (scope, el, sourcePrefix) => {
+      if (!scope) return;
+      try {
+        if (scope.page) {
+          addCandidate(scope.page.g_form, scope, el, sourcePrefix + ".page.g_form");
+          addCandidate(scope.page.gForm, scope, el, sourcePrefix + ".page.gForm");
+        }
+      } catch (e) {}
+      try {
+        addCandidate(scope.g_form, scope, el, sourcePrefix + ".g_form");
+        addCandidate(scope.gForm, scope, el, sourcePrefix + ".gForm");
+      } catch (e) {}
+      try {
+        if (typeof scope.getGlideForm === "function") {
+          addCandidate(scope.getGlideForm(), scope, el, sourcePrefix + ".getGlideForm()");
+        }
+      } catch (e) {}
+      try {
+        if (scope.$parent && typeof scope.$parent.getGlideForm === "function") {
+          addCandidate(scope.$parent.getGlideForm(), scope.$parent, el, sourcePrefix + ".$parent.getGlideForm()");
+        }
+      } catch (e) {}
+    };
+
     try {
-      if (typeof g_form !== "undefined" && isGForm(g_form)) return g_form;
+      if (typeof g_form !== "undefined") addCandidate(g_form, null, document.body, "global");
     } catch (e) {}
 
     const angular = getAngular();
-    if (!angular || !angular.element) return null;
+    if (!angular || !angular.element) {
+      candidates.sort((a, b) => b.score - a.score);
+      return candidates.length ? candidates[0].gForm : null;
+    }
 
     const selectors = [
+      "#sc_cat_item",
+      "#sc_cat_item sp-variable-layout",
+      "sp-variable-layout#sc_cat_item\\.do",
       "sp-variable-layout",
       "sp-cat-item",
       "sp-sc-cat-item",
@@ -225,20 +343,25 @@ function fillPortalVariables(variables) {
         const scopes = [];
         if (wrapped.scope) scopes.push(wrapped.scope());
         if (wrapped.isolateScope) scopes.push(wrapped.isolateScope());
-        for (const scope of scopes) {
-          const found = findGFormInObject(scope, 0, []);
-          if (found) return found;
+        for (let i = 0; i < scopes.length; i++) {
+          const scope = scopes[i];
+          addScopeCandidates(scope, el, "scope" + i);
+          const found = [];
+          findGFormsInObject(scope, 0, [], found);
+          found.forEach((gForm) => addCandidate(gForm, scope, el, "scope"));
         }
       } catch (e) {}
     }
-    return null;
+
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates.length ? candidates[0].gForm : null;
   };
 
   const hasPortalFormContainer = () => {
     try {
       return Boolean(
         document.querySelector(
-          "sp-variable-layout,sp-cat-item,sp-sc-cat-item,.sc-form,.catalog-form,[sp-model]"
+          "#sc_cat_item,sp-variable-layout,sp-cat-item,sp-sc-cat-item,.sc-form,.catalog-form,[sp-model]"
         )
       );
     } catch (e) {
@@ -258,17 +381,40 @@ function fillPortalVariables(variables) {
     return el.value != null ? el.value : el.textContent;
   };
 
+  const normalizeComparable = (value) =>
+    String(value == null ? "" : value)
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+
+  const sameValue = (left, right) => {
+    const a = normalizeComparable(left);
+    const b = normalizeComparable(right);
+    return Boolean(a && b && a === b);
+  };
+
+  const choiceLabel = (choice) =>
+    choice && (choice.display_value || choice.label || choice.text || choice.displayValue || choice.name || "");
+
   const findChoiceMatch = (choices, value, displayValue) => {
     if (!Array.isArray(choices)) return null;
-    return choices.find((choice) => String(choice.value) === value) ||
-      choices.find((choice) => String(choice.display_value || choice.label || choice.text) === displayValue) ||
-      choices.find((choice) => String(choice.display_value || choice.label || choice.text) === value);
+    return choices.find((choice) => sameValue(choice.value, value)) ||
+      choices.find((choice) => sameValue(choiceLabel(choice), displayValue)) ||
+      choices.find((choice) => sameValue(choiceLabel(choice), value));
   };
 
   const isReferenceVariable = (variable) => {
     const type = String((variable && variable.type) || "").trim().toLowerCase();
     return type === "8" || type === "reference";
   };
+
+  const isChoiceLikeVariable = (variable) => {
+    const type = String((variable && variable.type) || "").trim().toLowerCase();
+    return ["3", "5", "18", "choice", "multiple_choice", "select_box"].indexOf(type) >= 0;
+  };
+
+  const isKnownAsyncTriggerVariable = (variable) =>
+    ["country_site"].indexOf(String((variable && variable.name) || "").toLowerCase()) >= 0;
 
   const findAngularFieldScopes = (el, variable) => {
     const angular = getAngular();
@@ -325,6 +471,182 @@ function fillPortalVariables(variables) {
     } catch (e) {}
   };
 
+  const findRadioByChoiceScope = (radios, value, displayValue) => {
+    const angular = getAngular();
+    if (!angular || !angular.element) return null;
+
+    for (const radio of radios) {
+      try {
+        const wrapped = angular.element(radio);
+        const scopes = [];
+        if (wrapped.scope) scopes.push(wrapped.scope());
+        if (wrapped.isolateScope) scopes.push(wrapped.isolateScope());
+
+        for (const scope of scopes) {
+          const choice = scope && (scope.c || scope.choice || scope.option);
+          if (choice && findChoiceMatch([choice], value, displayValue)) return radio;
+        }
+      } catch (e) {}
+    }
+    return null;
+  };
+
+  const findRadioOption = (el, value, displayValue) => {
+    const radios = Array.from(
+      document.querySelectorAll(
+        'input[type="radio"][name="' + el.name.replace(/"/g, '\\"') + '"]'
+      )
+    );
+
+    return radios.find((radio) => sameValue(radio.value, value)) ||
+      radios.find((radio) => sameValue(radio.value, displayValue)) ||
+      radios.find((radio) => sameValue(radio.getAttribute("aria-label"), displayValue)) ||
+      radios.find((radio) => sameValue(radio.getAttribute("aria-label"), value)) ||
+      radios.find((radio) => sameValue(radio.closest("label") && radio.closest("label").textContent, displayValue)) ||
+      radios.find((radio) => sameValue(radio.closest("label") && radio.closest("label").textContent, value)) ||
+      findRadioByChoiceScope(radios, value, displayValue);
+  };
+
+  const selectRadioOption = (option) => {
+    if (!option) return false;
+    option.checked = true;
+    option.setAttribute("aria-checked", "true");
+    try {
+      option.click();
+    } catch (e) {}
+    ["input", "change", "blur"].forEach((eventName) => {
+      try {
+        option.dispatchEvent(new Event(eventName, { bubbles: true }));
+      } catch (e) {}
+    });
+    return true;
+  };
+
+  const visibleText = (el) =>
+    el && String(el.innerText || el.textContent || el.getAttribute("aria-label") || "").trim();
+
+  const clickOption = (option) => {
+    if (!option) return false;
+    ["mousedown", "mouseup", "click"].forEach((eventName) => {
+      try {
+        option.dispatchEvent(new MouseEvent(eventName, { bubbles: true, cancelable: true, view: window }));
+      } catch (e) {}
+    });
+    try {
+      option.click();
+    } catch (e) {}
+    return true;
+  };
+
+  const dispatchKeyboardCommit = (el) => {
+    if (!el) return;
+    ["ArrowDown", "Enter", "Tab"].forEach((key) => {
+      try {
+        el.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key,
+            code: key,
+            bubbles: true,
+            cancelable: true,
+            view: window,
+          })
+        );
+      } catch (e) {}
+    });
+  };
+
+  const findReferenceSuggestion = (value, displayValue) => {
+    const selectors = [
+      "[role='option']",
+      ".select2-result-selectable",
+      ".select2-result",
+      ".angucomplete-row",
+      ".typeahead li",
+      ".typeahead-result",
+      ".dropdown-menu li",
+      "ul[role='listbox'] li",
+      "li",
+    ];
+    const candidates = [];
+    selectors.forEach((selector) => {
+      try {
+        document.querySelectorAll(selector).forEach((option) => {
+          if (option.offsetParent !== null && candidates.indexOf(option) < 0) candidates.push(option);
+        });
+      } catch (e) {}
+    });
+
+    return candidates.find((option) => sameValue(visibleText(option), displayValue)) ||
+      candidates.find((option) => sameValue(visibleText(option), value)) ||
+      candidates.find((option) => {
+        const text = normalizeComparable(visibleText(option));
+        const display = normalizeComparable(displayValue);
+        const raw = normalizeComparable(value);
+        return Boolean(text && ((display && text.indexOf(display) >= 0) || (raw && text.indexOf(raw) >= 0)));
+      }) ||
+      (/^[0-9a-f]{32}$/i.test(String(value || "")) && sameValue(value, displayValue) ? candidates[0] : null);
+  };
+
+  const commitReferenceSuggestion = async (el, value, displayValue) => {
+    if (!displayValue && !value) return false;
+
+    const query = displayValue || value;
+    if (el && "value" in el) {
+      el.value = query;
+      ["focus", "input", "keyup"].forEach((eventName) => {
+        try {
+          el.dispatchEvent(new Event(eventName, { bubbles: true }));
+        } catch (e) {}
+      });
+      dispatchKeyboardCommit(el);
+    }
+
+    for (let i = 0; i < 8; i++) {
+      await sleep(125);
+      const option = findReferenceSuggestion(value, displayValue);
+      if (clickOption(option)) {
+        await sleep(125);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const invokeAngularChangeHandlers = (el, variable, value, displayValue) => {
+    const angular = getAngular();
+    if (!angular || !angular.element) return;
+
+    const scopes = findAngularFieldScopes(el, variable);
+    scopes.forEach((scope) => {
+      try {
+        if (scope.field) {
+          scope.field.value = value;
+          scope.field.display_value = displayValue;
+          scope.field.displayValue = displayValue;
+          scope.field.stagedValue = value;
+        }
+        ["onChange", "change", "fieldChange", "fieldChanged", "onFieldChange"].forEach((name) => {
+          try {
+            if (typeof scope[name] === "function") scope[name](scope.field, value, displayValue);
+          } catch (e) {}
+          try {
+            if (scope.field && typeof scope.field[name] === "function") {
+              scope.field[name](value, displayValue);
+            }
+          } catch (e) {}
+        });
+        if (typeof scope.$emit === "function") {
+          scope.$emit("field.change", scope.field || variable, value, displayValue);
+          scope.$emit("spModel.field.change", scope.field || variable, value, displayValue);
+        }
+        if (typeof scope.$broadcast === "function") {
+          scope.$broadcast("field.change", scope.field || variable, value, displayValue);
+        }
+        if (typeof scope.$applyAsync === "function") scope.$applyAsync();
+      } catch (e) {}
+    });
+  };
+
   const variableKeys = (variable) => {
     const keys = [];
     const add = (value) => {
@@ -341,11 +663,51 @@ function fillPortalVariables(variables) {
     return keys;
   };
 
-  const setElementValue = (el, variable) => {
+  const invokeGFormChangeHandlers = (gForm, key, variable, oldValue) => {
+    if (!gForm || !key) return;
+    const newValue = variable && variable.value != null ? String(variable.value) : "";
+    const displayValue = variable && variable.displayValue != null ? String(variable.displayValue) : newValue;
+
+    ["triggerOnChange", "_triggerOnChange", "fieldChanged", "onChange", "notifyChange", "change"].forEach((name) => {
+      try {
+        if (typeof gForm[name] === "function") gForm[name](key, oldValue || "", newValue, false);
+      } catch (e) {}
+      try {
+        if (typeof gForm[name] === "function") gForm[name](key, newValue, displayValue);
+      } catch (e) {}
+      try {
+        if (typeof gForm[name] === "function") gForm[name](key);
+      } catch (e) {}
+    });
+
+    try {
+      const events = gForm.$private && gForm.$private.events;
+      if (events && typeof events.fire === "function") {
+        events.fire("change", key, oldValue || "", newValue);
+        events.fire("propertyChange", key, oldValue || "", newValue);
+      }
+    } catch (e) {}
+  };
+
+  const setGFormValue = (gForm, key, variable) => {
+    if (!gForm || !key || !variable) return false;
+    try {
+      if (variable.displayValue && variable.displayValue !== variable.value) {
+        gForm.setValue(key, variable.value, variable.displayValue);
+      } else {
+        gForm.setValue(key, variable.value);
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  const setElementValue = async (el, variable) => {
     let value = variable.value == null ? "" : String(variable.value);
     let displayValue =
       variable.displayValue == null ? value : String(variable.displayValue);
-    const fieldScopes = findAngularFieldScopes(el, variable);
+    let fieldScopes = findAngularFieldScopes(el, variable);
     const isReference = isReferenceVariable(variable);
 
     fieldScopes.forEach((candidate) => {
@@ -360,14 +722,14 @@ function fillPortalVariables(variables) {
     if (el.type === "checkbox") {
       el.checked = ["true", "1", "yes", "y", "on"].includes(value.toLowerCase());
     } else if (el.type === "radio") {
-      const option = document.querySelector(
-        'input[type="radio"][name="' +
-          el.name.replace(/"/g, '\\"') +
-          '"][value="' +
-          value.replace(/"/g, '\\"') +
-          '"]'
-      );
-      if (option) option.checked = true;
+      const option = findRadioOption(el, value, displayValue);
+      if (!selectRadioOption(option)) return false;
+      if (option !== el) {
+        fieldScopes = fieldScopes.concat(
+          findAngularFieldScopes(option, variable).filter((scope) => fieldScopes.indexOf(scope) < 0)
+        );
+        el = option;
+      }
     } else if (el.isContentEditable) {
       el.textContent = value;
     } else if (el.tagName && el.tagName.toLowerCase() === "select") {
@@ -421,7 +783,7 @@ function fillPortalVariables(variables) {
 
         const ngModel = wrapped.controller("ngModel");
         if (ngModel && typeof ngModel.$setViewValue === "function") {
-          ngModel.$setViewValue(isReference ? displayValue : value);
+          ngModel.$setViewValue(value);
           if (typeof ngModel.$render === "function") ngModel.$render();
         }
         if (scope && typeof scope.$applyAsync === "function") scope.$applyAsync();
@@ -433,6 +795,11 @@ function fillPortalVariables(variables) {
 
     updateSelect2Display(el, value, displayValue);
 
+    if (isReference && !(el.classList && el.classList.contains("select2-offscreen"))) {
+      await commitReferenceSuggestion(el, value, displayValue);
+    }
+    invokeAngularChangeHandlers(el, variable, value, displayValue);
+
     try {
       const jq = window.jQuery || window.$;
       if (jq) {
@@ -441,6 +808,9 @@ function fillPortalVariables(variables) {
           try {
             wrapped.select2("close");
           } catch (e) {}
+        } else if (isReference) {
+          wrapped.trigger("change");
+          wrapped.trigger("blur");
         } else {
           wrapped.val(el.value || value);
           wrapped.trigger("input");
@@ -455,6 +825,8 @@ function fillPortalVariables(variables) {
         el.dispatchEvent(new Event(eventName, { bubbles: true }));
       } catch (e) {}
     });
+
+    return true;
   };
 
   const findDomField = (variable) => {
@@ -464,7 +836,7 @@ function fillPortalVariables(variables) {
       document.querySelectorAll("input,textarea,select,[contenteditable='true']")
     ).filter((el) => el.type !== "hidden");
 
-    return candidates.find((el) => {
+    const direct = candidates.find((el) => {
       const attrs = [
         el.getAttribute("name"),
         el.getAttribute("id"),
@@ -476,79 +848,181 @@ function fillPortalVariables(variables) {
       ].filter(Boolean);
       return attrs.some((attr) => keys.indexOf(attr) >= 0 || (label && attr === label));
     });
+
+    if (direct) return direct;
+
+    const fieldContainers = Array.from(
+      document.querySelectorAll(
+        "fieldset,[id^='sp_formfield_'],[data-variable-name],[data-field-name],[data-name]"
+      )
+    );
+    const matchesContainer = (el) => {
+      const attrs = [
+        el.getAttribute("id"),
+        el.getAttribute("name"),
+        el.getAttribute("data-name"),
+        el.getAttribute("data-variable-name"),
+        el.getAttribute("data-field"),
+        el.getAttribute("data-field-name"),
+        el.getAttribute("aria-label"),
+      ].filter(Boolean);
+
+      return attrs.some((attr) => {
+        const normalizedAttr = attr.replace(/^sp_formfield_/, "");
+        return keys.indexOf(attr) >= 0 ||
+          keys.indexOf(normalizedAttr) >= 0 ||
+          (label && sameValue(attr, label));
+      });
+    };
+
+    const container = fieldContainers.find(matchesContainer);
+    if (!container) return null;
+    return container.querySelector("input:not([type='hidden']),textarea,select,[contenteditable='true']");
   };
 
-  const fillDomVariable = (variable) => {
+  const fillDomVariable = async (variable) => {
     const el = findDomField(variable);
     if (!el) return "missing";
     result.foundForm = true;
     if (!isEmpty(getElementValue(el))) return "already";
-    setElementValue(el, variable);
+    if (!(await setElementValue(el, variable))) return "missing";
     return "filled";
   };
 
-  const fillWithDom = () => {
+  const triggerDomChangeForVariable = async (variable) => {
+    const el = findDomField(variable);
+    if (!el) return false;
+    result.foundForm = true;
+    return Boolean(await setElementValue(el, variable));
+  };
+
+  const delayAfterVariableChange = async (variable) => {
+    let delay = simpleFillDelayMs;
+    if (isChoiceLikeVariable(variable)) delay = choiceFillDelayMs;
+    if (isReferenceVariable(variable)) delay = referenceFillDelayMs;
+    if (isKnownAsyncTriggerVariable(variable)) delay = triggerReferenceDelayMs;
+    if (delay > 0) await sleep(delay);
+  };
+
+  const fillWithDom = async () => {
     result.foundForm = hasPortalFormContainer();
-    values.forEach((variable) => {
-      if (!variable || !variable.name || isUnsupported(variable)) {
-        result.skipped++;
-        return;
+    if (!result.foundForm) return result;
+
+    const fillDomBatch = async (batch, pass) => {
+      const missing = [];
+      let index = 0;
+      for (const variable of batch) {
+        index++;
+        if (!variable || !variable.name || isUnsupported(variable)) {
+          if (pass === 1) result.skipped++;
+          continue;
+        }
+        try {
+          const prefix = pass > 1 ? "Retrying" : "Filling";
+          emitProgress(prefix + " " + index + " of " + batch.length + ": " + (variable.label || variable.name));
+          const domResult = await fillDomVariable(variable);
+          if (domResult === "filled") {
+            result.filled++;
+            await delayAfterVariableChange(variable);
+          } else if (domResult === "already") {
+            result.alreadySet++;
+          } else {
+            missing.push(variable);
+          }
+        } catch (e) {
+          if (pass === maxFillPasses) result.skipped++;
+          else missing.push(variable);
+        }
       }
-      try {
-        const domResult = fillDomVariable(variable);
-        if (domResult === "filled") result.filled++;
-        else if (domResult === "already") result.alreadySet++;
-        else result.unmatched++;
-      } catch (e) {
-        result.skipped++;
-      }
-    });
+      return missing;
+    };
+
+    let pending = await fillDomBatch(values, 1);
+    for (let pass = 2; pass <= maxFillPasses && pending.length; pass++) {
+      emitProgress("Waiting for dependent fields...");
+      await sleep(retryDelayMs);
+      pending = await fillDomBatch(pending, pass);
+    }
+
+    result.unmatched += pending.length;
     return result;
   };
 
-  const fillWithGForm = (gForm) => {
+  const fillWithGForm = async (gForm) => {
     result.foundForm = true;
-    values.forEach((variable) => {
-      if (!variable || !variable.name || isUnsupported(variable)) {
-        result.skipped++;
-        return;
-      }
 
-      let handled = false;
-      for (const key of variableKeys(variable)) {
-        try {
-          const current = gForm.getValue(key);
-          if (!isEmpty(current)) {
-            result.alreadySet++;
+    const fillBatch = async (batch, pass) => {
+      const missing = [];
+      let index = 0;
+      for (const variable of batch) {
+        index++;
+        if (!variable || !variable.name || isUnsupported(variable)) {
+          if (pass === 1) result.skipped++;
+          continue;
+        }
+
+        let handled = false;
+        for (const key of variableKeys(variable)) {
+          try {
+            const prefix = pass > 1 ? "Retrying" : "Filling";
+            emitProgress(prefix + " " + index + " of " + batch.length + ": " + (variable.label || variable.name));
+            const current = gForm.getValue(key);
+            if (!isEmpty(current)) {
+              if (isKnownAsyncTriggerVariable(variable)) {
+                await triggerDomChangeForVariable(variable);
+                setGFormValue(gForm, key, variable);
+                invokeGFormChangeHandlers(gForm, key, variable, current);
+                await delayAfterVariableChange(variable);
+              }
+              result.alreadySet++;
+              handled = true;
+              break;
+            }
+            if (!setGFormValue(gForm, key, variable)) continue;
+            await triggerDomChangeForVariable(variable);
+            setGFormValue(gForm, key, variable);
+            invokeGFormChangeHandlers(gForm, key, variable, current);
+            result.filled++;
             handled = true;
+            await delayAfterVariableChange(variable);
             break;
-          }
-          if (variable.displayValue && variable.displayValue !== variable.value) {
-            gForm.setValue(key, variable.value, variable.displayValue);
-          } else {
-            gForm.setValue(key, variable.value);
-          }
-          result.filled++;
-          handled = true;
-          break;
-        } catch (e) {}
-      }
+          } catch (e) {}
+        }
 
-      if (handled) return;
-      try {
-        const domResult = fillDomVariable(variable);
-        if (domResult === "filled") result.filled++;
-        else if (domResult === "already") result.alreadySet++;
-        else result.unmatched++;
-      } catch (e) {
-        result.skipped++;
+        if (handled) continue;
+        try {
+          const prefix = pass > 1 ? "Retrying" : "Filling";
+          emitProgress(prefix + " " + index + " of " + batch.length + ": " + (variable.label || variable.name));
+          const domResult = await fillDomVariable(variable);
+          if (domResult === "filled") {
+            result.filled++;
+            await delayAfterVariableChange(variable);
+          } else if (domResult === "already") {
+            result.alreadySet++;
+          } else {
+            missing.push(variable);
+          }
+        } catch (e) {
+          if (pass === maxFillPasses) result.skipped++;
+          else missing.push(variable);
+        }
       }
-    });
+      return missing;
+    };
+
+    let pending = await fillBatch(values, 1);
+    for (let pass = 2; pass <= maxFillPasses && pending.length; pass++) {
+      emitProgress("Waiting for dependent fields...");
+      await sleep(retryDelayMs);
+      pending = await fillBatch(pending, pass);
+    }
+
+    result.unmatched += pending.length;
     return result;
   };
 
   const gForm = findPortalGForm();
-  return gForm ? fillWithGForm(gForm) : fillWithDom();
+  return gForm ? await fillWithGForm(gForm) : await fillWithDom();
 }
 
 function inspectPortalVariableDebug() {
@@ -559,6 +1033,7 @@ function inspectPortalVariableDebug() {
     hasGlobalGForm: false,
     portalContainers: 0,
     gForm: null,
+    gFormCandidates: [],
     angularFields: [],
     domFields: [],
   };
@@ -577,7 +1052,7 @@ function inspectPortalVariableDebug() {
 
   try {
     report.portalContainers = document.querySelectorAll(
-      "sp-variable-layout,sp-cat-item,sp-sc-cat-item,.sc-form,.catalog-form,[sp-model]"
+      "#sc_cat_item,sp-variable-layout,sp-cat-item,sp-sc-cat-item,.sc-form,.catalog-form,[sp-model]"
     ).length;
   } catch (e) {}
 
@@ -590,8 +1065,15 @@ function inspectPortalVariableDebug() {
   } catch (e) {}
 
   const summarizeGForm = (gForm, source) => {
-    if (!gForm || report.gForm) return;
+    if (!gForm) return;
+    if (report.gFormCandidates.some((candidate) => candidate.source === source)) return;
     const summary = { source, keys: [], fieldNames: [] };
+    try {
+      summary.sysId = typeof gForm.getSysId === "function" ? safeValue(gForm.getSysId()) : "";
+    } catch (e) {}
+    try {
+      summary.countrySite = typeof gForm.getValue === "function" ? safeValue(gForm.getValue("country_site")) : "";
+    } catch (e) {}
     try {
       summary.keys = Object.keys(gForm).slice(0, 80);
     } catch (e) {}
@@ -613,7 +1095,32 @@ function inspectPortalVariableDebug() {
         }
       } catch (e) {}
     });
-    report.gForm = summary;
+    report.gFormCandidates.push(summary);
+    if (!report.gForm) report.gForm = summary;
+  };
+
+  const summarizeScopeGForms = (scope, source) => {
+    if (!scope) return;
+    try {
+      if (scope.page) {
+        summarizeGForm(scope.page.g_form, source + ".page.g_form");
+        summarizeGForm(scope.page.gForm, source + ".page.gForm");
+      }
+    } catch (e) {}
+    try {
+      summarizeGForm(scope.g_form, source + ".g_form");
+      summarizeGForm(scope.gForm, source + ".gForm");
+    } catch (e) {}
+    try {
+      if (typeof scope.getGlideForm === "function") {
+        summarizeGForm(scope.getGlideForm(), source + ".getGlideForm()");
+      }
+    } catch (e) {}
+    try {
+      if (scope.$parent && typeof scope.$parent.getGlideForm === "function") {
+        summarizeGForm(scope.$parent.getGlideForm(), source + ".$parent.getGlideForm()");
+      }
+    } catch (e) {}
   };
 
   try {
@@ -679,6 +1186,9 @@ function inspectPortalVariableDebug() {
   if (angular && angular.element) {
     const elements = [];
     [
+      "#sc_cat_item",
+      "#sc_cat_item sp-variable-layout",
+      "sp-variable-layout#sc_cat_item\\.do",
       "sp-variable-layout",
       "sp-cat-item",
       "sp-sc-cat-item",
@@ -696,9 +1206,15 @@ function inspectPortalVariableDebug() {
     elements.slice(0, 80).forEach((el, index) => {
       try {
         const wrapped = angular.element(el);
-        if (wrapped.scope) scanObjectForFields(wrapped.scope(), "scope[" + index + "]", 0, []);
+        if (wrapped.scope) {
+          const scope = wrapped.scope();
+          summarizeScopeGForms(scope, "scope[" + index + "]");
+          scanObjectForFields(scope, "scope[" + index + "]", 0, []);
+        }
         if (wrapped.isolateScope) {
-          scanObjectForFields(wrapped.isolateScope(), "isolateScope[" + index + "]", 0, []);
+          const isolateScope = wrapped.isolateScope();
+          summarizeScopeGForms(isolateScope, "isolateScope[" + index + "]");
+          scanObjectForFields(isolateScope, "isolateScope[" + index + "]", 0, []);
         }
       } catch (e) {}
     });
@@ -834,6 +1350,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: false, error: String(error) });
     });
     return true;
+  }
+  if (msg && msg.type === "PREFILL_PROGRESS" && sender.tab) {
+    sendToTab(
+      sender.tab.id,
+      { type: "PREFILL_PROGRESS", message: msg.message || "Filling portal form..." },
+      { frameId: 0 }
+    );
   }
   // A sub-frame (e.g. gsft_main) pressed the shortcut; relay to the whole
   // tab so the top frame's content script can toggle the palette.

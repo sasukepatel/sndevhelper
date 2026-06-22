@@ -13,6 +13,7 @@
 
 const SNH = { fieldNamesOn: false, transIconsOn: false, lastPrefillVariables: [] };
 const SNH_FRAME_COMMAND_SOURCE = "SN_DEV_HELPER_FRAME_COMMAND";
+const SNH_PREFILL_PROGRESS_SOURCE = "SN_DEV_HELPER_PREFILL_PROGRESS";
 const WORKSPACE_FIELD_ATTRS = [
   "data-field-name",
   "data-fieldname",
@@ -81,10 +82,23 @@ function broadcastFrameCommand(type) {
 
 window.addEventListener("message", (event) => {
   const msg = event.data;
-  if (!msg || msg.source !== SNH_FRAME_COMMAND_SOURCE) return;
+  if (!msg) return;
   if (event.origin && event.origin !== location.origin) return;
 
-  handleFrameCommand(msg.type);
+  if (msg.source === SNH_FRAME_COMMAND_SOURCE) {
+    handleFrameCommand(msg.type);
+  }
+
+  if (msg.source === SNH_PREFILL_PROGRESS_SOURCE) {
+    if (window === window.top) {
+      showToast(msg.message || "Filling portal form...", false, 6000);
+    } else {
+      chrome.runtime.sendMessage({
+        type: "PREFILL_PROGRESS",
+        message: msg.message || "Filling portal form...",
+      });
+    }
+  }
 });
 
 function decodedVariants(text) {
@@ -501,6 +515,15 @@ function isUnsupportedVariableType(type) {
   return normalized && UNSUPPORTED_VARIABLE_TYPES.has(normalized);
 }
 
+function parseVariableOrder(value) {
+  const text = String(value == null ? "" : value).trim();
+  if (!text) return { known: false, value: 0 };
+  const order = Number(text);
+  return Number.isFinite(order)
+    ? { known: true, value: order }
+    : { known: false, value: 0 };
+}
+
 function normalizeSourceVariable(row, mapping) {
   const name = snFieldValue(row, mapping.name).trim();
   const value = snFieldValue(row, mapping.value);
@@ -508,6 +531,7 @@ function normalizeSourceVariable(row, mapping) {
 
   const type = snFieldValue(row, mapping.type);
   if (isUnsupportedVariableType(type)) return { variable: null, skipped: 1 };
+  const order = parseVariableOrder(mapping.order ? snFieldValue(row, mapping.order) : "");
 
   return {
     variable: {
@@ -516,6 +540,8 @@ function normalizeSourceVariable(row, mapping) {
       type,
       value,
       displayValue: snFieldDisplay(row, mapping.value),
+      order: order.value,
+      orderKnown: order.known,
       questionId: mapping.questionId ? snFieldValue(row, mapping.questionId) : "",
       referenceTable:
         (mapping.referenceTable ? snFieldValue(row, mapping.referenceTable) : "") ||
@@ -527,11 +553,12 @@ function normalizeSourceVariable(row, mapping) {
 
 function addVariablesFromRows(target, rows, mapping) {
   let skipped = 0;
-  rows.forEach((row) => {
+  rows.forEach((row, index) => {
     const normalized = normalizeSourceVariable(row, mapping);
     skipped += normalized.skipped;
     if (!normalized.variable) return;
     if (!target.has(normalized.variable.name)) {
+      normalized.variable.sourceIndex = target.size + index / 100000;
       target.set(normalized.variable.name, normalized.variable);
     }
   });
@@ -548,6 +575,7 @@ async function fetchCatalogVariables(requestItemId) {
       "sc_item_option.item_option_new.name",
       "sc_item_option.item_option_new.question_text",
       "sc_item_option.item_option_new.type",
+      "sc_item_option.item_option_new.order",
       "sc_item_option.item_option_new.reference",
       "sc_item_option.item_option_new.lookup_table",
     ].join(","),
@@ -559,6 +587,7 @@ async function fetchCatalogVariables(requestItemId) {
     name: "sc_item_option.item_option_new.name",
     label: "sc_item_option.item_option_new.question_text",
     type: "sc_item_option.item_option_new.type",
+    order: "sc_item_option.item_option_new.order",
     value: "sc_item_option.value",
     questionId: "sc_item_option.item_option_new",
     referenceTable: "sc_item_option.item_option_new.reference",
@@ -574,6 +603,7 @@ async function fetchProducerVariables(sysId) {
     "question.name",
     "question.question_text",
     "question.type",
+    "question.order",
     "question.reference",
     "question.lookup_table",
   ].join(",");
@@ -594,6 +624,7 @@ async function fetchProducerVariables(sysId) {
         name: "question.name",
         label: "question.question_text",
         type: "question.type",
+        order: "question.order",
         value: "value",
         questionId: "question",
         referenceTable: "question.reference",
@@ -621,6 +652,10 @@ function bestDisplayValue(row) {
     "title",
     "short_description",
     "u_name",
+    "u_display_name",
+    "u_site_name",
+    "u_location_name",
+    "u_label",
     "street",
   ];
   for (const field of displayFields) {
@@ -631,10 +666,27 @@ function bestDisplayValue(row) {
   const locationParts = ["street", "city", "state"].map((field) => snFieldDisplay(row, field)).filter(Boolean);
   if (locationParts.length) return locationParts.join(", ");
 
+  const preferredKeyPattern = /(^|_)(display|name|title|label|description|site|location)(_|$)/i;
+  const ignoredKeyPattern = /sys_|^u?active$|^id$|^value$|^link$|^order$/i;
+  const keys = Object.keys(row || {}).filter((key) => preferredKeyPattern.test(key) && !ignoredKeyPattern.test(key));
+  for (const key of keys) {
+    const value = snFieldDisplay(row, key);
+    if (value && !isSysId(value)) return value;
+  }
+
   return "";
 }
 
-async function resolveReferenceDisplayValues(variables) {
+async function resolveReferenceDisplayValues(variables, onProgress) {
+  const referenceVariables = Array.from(variables.values()).filter(
+    (variable) =>
+      isReferenceVariable(variable) &&
+      isSysId(variable.value) &&
+      (!variable.displayValue || variable.displayValue === variable.value || isSysId(variable.displayValue)) &&
+      variable.referenceTable
+  );
+  let index = 0;
+
   for (const variable of variables.values()) {
     if (!isReferenceVariable(variable) || !isSysId(variable.value)) continue;
     if (variable.displayValue && variable.displayValue !== variable.value && !isSysId(variable.displayValue)) {
@@ -643,17 +695,34 @@ async function resolveReferenceDisplayValues(variables) {
 
     const table = variable.referenceTable || "";
     if (!table) continue;
+    index++;
+    if (onProgress) {
+      onProgress(
+        "Resolving reference values " +
+          index +
+          " of " +
+          referenceVariables.length +
+          ": " +
+          (variable.label || variable.name)
+      );
+    }
 
     try {
       const rows = await snGetMany(
         table,
         "sys_id=" + variable.value,
-        "sys_id,name,number,display_name,title,short_description,u_name,street,city,state",
+        "sys_id,name,number,display_name,title,short_description,u_name,u_display_name,u_site_name,u_location_name,u_label,street,city,state",
         1,
         { displayAll: true, excludeRefLinks: true }
       );
-      if (!rows.length) continue;
-      const display = bestDisplayValue(rows[0]);
+      let display = rows.length ? bestDisplayValue(rows[0]) : "";
+      if (!display) {
+        const broadRows = await snGetMany(table, "sys_id=" + variable.value, "", 1, {
+          displayAll: true,
+          excludeRefLinks: true,
+        });
+        display = broadRows.length ? bestDisplayValue(broadRows[0]) : "";
+      }
       if (display) variable.displayValue = display;
     } catch (e) {
       /* Keep the sys_id fallback if reference display lookup is blocked. */
@@ -661,13 +730,27 @@ async function resolveReferenceDisplayValues(variables) {
   }
 }
 
-async function fetchSourceVariables(source) {
+function sortVariablesForFill(variables) {
+  return Array.from(variables.values()).sort((a, b) => {
+    if (a.orderKnown !== b.orderKnown) return a.orderKnown ? 1 : -1;
+    const orderA = Number.isFinite(a.order) ? a.order : 0;
+    const orderB = Number.isFinite(b.order) ? b.order : 0;
+    if (orderA !== orderB) return orderA - orderB;
+    const indexA = Number.isFinite(a.sourceIndex) ? a.sourceIndex : 999999;
+    const indexB = Number.isFinite(b.sourceIndex) ? b.sourceIndex : 999999;
+    if (indexA !== indexB) return indexA - indexB;
+    return String(a.name || "").localeCompare(String(b.name || ""));
+  });
+}
+
+async function fetchSourceVariables(source, onProgress) {
   const variables = new Map();
   let skipped = 0;
   let hadReadError = false;
 
   if (source.mode === "catalog" && source.requestItemId) {
     try {
+      if (onProgress) onProgress("Reading catalog variables...");
       const catalog = await fetchCatalogVariables(source.requestItemId);
       skipped += catalog.skipped;
       catalog.variables.forEach((variable, name) => variables.set(name, variable));
@@ -677,6 +760,7 @@ async function fetchSourceVariables(source) {
   }
 
   try {
+    if (onProgress) onProgress("Reading producer variables...");
     const producer = await fetchProducerVariables(source.sysId);
     skipped += producer.skipped;
     producer.variables.forEach((variable, name) => {
@@ -690,9 +774,9 @@ async function fetchSourceVariables(source) {
     throw new Error("Couldn't read variables. Check access to catalog variable tables.");
   }
 
-  await resolveReferenceDisplayValues(variables);
+  await resolveReferenceDisplayValues(variables, onProgress);
 
-  return { variables: Array.from(variables.values()), skipped };
+  return { variables: sortVariablesForFill(variables), skipped };
 }
 
 async function prefillPortalVariablesFromTicket(input) {
@@ -702,10 +786,10 @@ async function prefillPortalVariablesFromTicket(input) {
     return;
   }
 
-  showToast("Reading variables...");
+  showToast("Reading variables...", false, 6000);
   try {
     const source = await resolveVariableSource(value);
-    const sourceResult = await fetchSourceVariables(source);
+    const sourceResult = await fetchSourceVariables(source, (message) => showToast(message, false, 6000));
     const variables = sourceResult.variables;
     SNH.lastPrefillVariables = variables;
     if (!variables.length) {
@@ -714,7 +798,8 @@ async function prefillPortalVariablesFromTicket(input) {
       return;
     }
 
-    showToast("Filling portal form...");
+    showToast("Found " + variables.length + " variables. Filling portal form...", false, 6000);
+    await new Promise((resolve) => setTimeout(resolve, 75));
     const resp = await chrome.runtime.sendMessage({
       type: "FILL_PORTAL_VARIABLES",
       variables,
@@ -908,6 +993,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // Only the top frame owns the palette to avoid duplicate overlays.
     if (window === window.top) togglePalette();
   }
+  if (msg && msg.type === "PREFILL_PROGRESS") {
+    if (window === window.top) showToast(msg.message || "Filling portal form...", false, 6000);
+  }
   return true;
 });
 
@@ -1098,7 +1186,7 @@ const PALETTE_CSS = `
   #empty{padding:20px 16px;color:#555;font-size:13px;text-align:center}
 `;
 
-function showToast(msg, isErr) {
+function showToast(msg, isErr, durationMs) {
   if (!paletteToast) return;
   paletteToast.textContent = msg;
   paletteToast.className = isErr ? "err" : "";
@@ -1106,7 +1194,7 @@ function showToast(msg, isErr) {
   clearTimeout(showToast._t);
   showToast._t = setTimeout(() => {
     if (paletteToast) paletteToast.style.display = "none";
-  }, 2200);
+  }, durationMs || 2200);
 }
 
 async function copyText(text) {
