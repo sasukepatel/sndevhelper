@@ -123,8 +123,10 @@ async function fillPortalVariables(variables) {
     skipped: 0,
     unmatched: 0,
     total: Array.isArray(variables) ? variables.length : 0,
+    fillLog: [],
   };
   const values = Array.isArray(variables) ? variables : [];
+  let fillAttempt = 0;
   const simpleFillDelayMs = 25;
   const choiceFillDelayMs = 150;
   const referenceFillDelayMs = 400;
@@ -153,19 +155,18 @@ async function fillPortalVariables(variables) {
     "24",
     "25",
     "31",
-    "33",
-    "attachment",
     "container",
     "container_end",
     "container_start",
     "encrypted",
     "label",
     "macro",
-    "multi_row",
-    "multi_row_variable_set",
     "password",
     "rich_text_label",
   ]);
+
+  const normalizeVariableType = (type) =>
+    String(type || "").trim().toLowerCase().replace(/\s+/g, "_");
 
   const isEmpty = (value) =>
     value == null ||
@@ -173,10 +174,7 @@ async function fillPortalVariables(variables) {
     (Array.isArray(value) && value.length === 0);
 
   const isUnsupported = (variable) => {
-    const type = String((variable && variable.type) || "")
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, "_");
+    const type = normalizeVariableType((variable && variable.type) || "");
     return Boolean(type && unsupportedTypes.has(type));
   };
 
@@ -424,18 +422,12 @@ async function fillPortalVariables(variables) {
   };
 
   const isGlideListVariable = (variable) => {
-    const type = String((variable && variable.type) || "")
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, "_");
+    const type = normalizeVariableType((variable && variable.type) || "");
     return type === "21" || type === "glide_list" || type === "glide-list" || type === "list_collector";
   };
 
   const isGlideListField = (field) => {
-    const type = String((field && (field.type || field.display_type || field.fieldType)) || "")
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, "_");
+    const type = normalizeVariableType((field && (field.type || field.display_type || field.fieldType)) || "");
     return type === "glide_list" || type === "glide-list";
   };
 
@@ -466,11 +458,51 @@ async function fillPortalVariables(variables) {
   };
 
   const isCheckboxVariable = (variable) => {
-    const type = String((variable && variable.type) || "")
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, "_");
+    const type = normalizeVariableType((variable && variable.type) || "");
     return type === "7" || type === "boolean" || type === "checkbox" || type === "checkbox_container";
+  };
+
+  const isAttachmentVariable = (variable) => {
+    const type = normalizeVariableType((variable && variable.type) || "");
+    return type === "33" || type === "attachment";
+  };
+
+  const isMultiRowVariableSet = (variable) => {
+    const type = normalizeVariableType((variable && variable.type) || "");
+    return (
+      type === "34" ||
+      type === "multi_row" ||
+      type === "multi_row_variable_set" ||
+      type === "multi-row_variable_set"
+    );
+  };
+
+  const splitFillBatches = () => ({
+    normal: values.filter((variable) => !isMultiRowVariableSet(variable)),
+    mrvs: values.filter(isMultiRowVariableSet),
+  });
+
+  const logFill = (stage, variable, pass, batchIndex, batchTotal, outcome, details) => {
+    fillAttempt++;
+    if (result.fillLog.length >= 600) return;
+    result.fillLog.push(Object.assign({
+      attempt: fillAttempt,
+      sourceFillOrder: variable && variable.fillOrder,
+      pass,
+      batchIndex,
+      batchTotal,
+      stage,
+      outcome,
+      name: variable && variable.name,
+      label: variable && variable.label,
+      type: variable && variable.type,
+      isMrvs: Boolean(isMultiRowVariableSet(variable)),
+      questionOrder: variable && variable.order,
+      orderKnown: Boolean(variable && variable.orderKnown),
+      rowCount: variable && variable.rowCount,
+      valueLength: variable && variable.value != null ? String(variable.value).length : 0,
+      displayValueLength: variable && variable.displayValue != null ? String(variable.displayValue).length : 0,
+    }, details || {}));
   };
 
   const isDomFirstVariable = (variable) =>
@@ -518,6 +550,15 @@ async function fillPortalVariables(variables) {
       id,
       text: displays[index] || id,
     }));
+  };
+
+  const parseMultiRowValue = (value) => {
+    try {
+      const parsed = JSON.parse(String(value || "[]"));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) {
+      return [];
+    }
   };
 
   const updateSelect2Display = (el, value, displayValue) => {
@@ -1008,6 +1049,20 @@ async function fillPortalVariables(variables) {
     field.selectedDisplayValue = displayValue;
   };
 
+  const applyMultiRowValueToField = (field, value, displayValue) => {
+    if (!field) return;
+    const rows = parseMultiRowValue(value);
+    const displayRows = parseMultiRowValue(displayValue);
+    field.value = value;
+    field.stagedValue = value;
+    field.display_value = displayValue;
+    field.displayValue = displayValue;
+    field.rows = rows;
+    field._rows = rows;
+    field.data = rows;
+    field.displayRows = displayRows;
+  };
+
   const invokeGFormChangeHandlers = (gForm, key, variable, oldValue) => {
     if (!gForm || !key) return;
     const newValue = variable && variable.value != null ? String(variable.value) : "";
@@ -1037,6 +1092,10 @@ async function fillPortalVariables(variables) {
   const setGFormValue = (gForm, key, variable) => {
     if (!gForm || !key || !variable) return false;
     try {
+      if (isMultiRowVariableSet(variable)) {
+        gForm.setValue(key, variable.value || "[]");
+        return true;
+      }
       if (variable.displayValue && variable.displayValue !== variable.value) {
         gForm.setValue(key, variable.value, variable.displayValue);
       } else {
@@ -1055,6 +1114,8 @@ async function fillPortalVariables(variables) {
     let fieldScopes = findAngularFieldScopes(el, variable);
     const isReference = isReferenceVariable(variable);
     const isChoice = isChoiceLikeVariable(variable);
+    const isAttachment = isAttachmentVariable(variable);
+    const isMultiRow = isMultiRowVariableSet(variable);
     const isGlideList =
       isGlideListVariable(variable) ||
       fieldScopes.some((candidate) => candidate && isGlideListField(candidate.field)) ||
@@ -1090,6 +1151,8 @@ async function fillPortalVariables(variables) {
         );
         el = option;
       }
+    } else if (el.type === "file") {
+      /* Browsers block assigning a file input; keep the page model in sync below. */
     } else if (el.isContentEditable) {
       el.textContent = value;
     } else if (el.tagName && el.tagName.toLowerCase() === "select") {
@@ -1126,11 +1189,13 @@ async function fillPortalVariables(variables) {
           if (!fieldMatchesVariable(candidate.field, variable)) {
             return;
           }
-          applyValueToField(candidate.field, value, displayValue, isGlideList);
+          if (isMultiRow) applyMultiRowValueToField(candidate.field, value, displayValue);
+          else applyValueToField(candidate.field, value, displayValue, isGlideList);
         });
 
         findAngularFieldModels(variable).forEach((field) => {
-          applyValueToField(field, value, displayValue, isGlideList || isGlideListField(field));
+          if (isMultiRow) applyMultiRowValueToField(field, value, displayValue);
+          else applyValueToField(field, value, displayValue, isGlideList || isGlideListField(field));
         });
 
         if (scope && Object.prototype.hasOwnProperty.call(scope, "fieldValue")) {
@@ -1184,6 +1249,9 @@ async function fillPortalVariables(variables) {
             wrapped.select2("close");
           } catch (e) {}
         } else if (isReference) {
+          wrapped.trigger("change");
+          wrapped.trigger("blur");
+        } else if (isAttachment || isMultiRow) {
           wrapped.trigger("change");
           wrapped.trigger("blur");
         } else {
@@ -1300,7 +1368,7 @@ async function fillPortalVariables(variables) {
     const current = getElementValue(el);
     const value = variable && variable.value != null ? String(variable.value) : "";
     const displayValue = variable && variable.displayValue != null ? String(variable.displayValue) : value;
-    if (isSameFilledValue(current, value, displayValue)) {
+    if (!isMultiRowVariableSet(variable) && isSameFilledValue(current, value, displayValue)) {
       if (isReferenceVariable(variable) && select2ContainerForElement(el)) {
         if (!(await setElementValue(el, variable))) return "missing";
         return "filled";
@@ -1344,12 +1412,14 @@ async function fillPortalVariables(variables) {
         index++;
         if (!variable || !variable.name || isUnsupported(variable)) {
           if (pass === 1) result.skipped++;
+          logFill("dom", variable, pass, index, batch.length, "skipped", { reason: "unsupported_or_missing_name" });
           continue;
         }
         try {
           const prefix = pass > 1 ? "Retrying" : "Filling";
           emitProgress(prefix + " " + index + " of " + batch.length + ": " + (variable.label || variable.name));
           const domResult = await fillDomVariable(variable);
+          logFill("dom", variable, pass, index, batch.length, domResult);
           if (domResult === "filled") {
             result.filled++;
             await delayAfterVariableChange(variable);
@@ -1359,6 +1429,9 @@ async function fillPortalVariables(variables) {
             missing.push(variable);
           }
         } catch (e) {
+          logFill("dom", variable, pass, index, batch.length, "error", {
+            error: String(e && e.message ? e.message : e),
+          });
           if (pass === maxFillPasses) result.skipped++;
           else missing.push(variable);
         }
@@ -1366,14 +1439,26 @@ async function fillPortalVariables(variables) {
       return missing;
     };
 
-    let pending = await fillDomBatch(values, 1);
+    const batches = splitFillBatches();
+    let pending = await fillDomBatch(batches.normal, 1);
     for (let pass = 2; pass <= maxFillPasses && pending.length; pass++) {
       emitProgress("Waiting for dependent fields...");
       await sleep(retryDelayMs);
       pending = await fillDomBatch(pending, pass);
     }
-
     result.unmatched += pending.length;
+
+    if (batches.mrvs.length) {
+      emitProgress("Filling multi-row variable sets...");
+      await sleep(retryDelayMs);
+      let pendingMrvs = await fillDomBatch(batches.mrvs, 1);
+      for (let pass = 2; pass <= maxFillPasses && pendingMrvs.length; pass++) {
+        emitProgress("Retrying multi-row variable sets...");
+        await sleep(retryDelayMs);
+        pendingMrvs = await fillDomBatch(pendingMrvs, pass);
+      }
+      result.unmatched += pendingMrvs.length;
+    }
     return result;
   };
 
@@ -1387,6 +1472,7 @@ async function fillPortalVariables(variables) {
         index++;
         if (!variable || !variable.name || isUnsupported(variable)) {
           if (pass === 1) result.skipped++;
+          logFill("g_form", variable, pass, index, batch.length, "skipped", { reason: "unsupported_or_missing_name" });
           continue;
         }
 
@@ -1396,6 +1482,7 @@ async function fillPortalVariables(variables) {
             const prefix = pass > 1 ? "Retrying" : "Filling";
             emitProgress(prefix + " " + index + " of " + batch.length + ": " + (variable.label || variable.name));
             const domResult = await fillDomVariable(variable);
+            logFill("dom-first", variable, pass, index, batch.length, domResult);
             if (domResult === "filled") {
               result.filled++;
               await delayAfterVariableChange(variable);
@@ -1414,13 +1501,17 @@ async function fillPortalVariables(variables) {
             const prefix = pass > 1 ? "Retrying" : "Filling";
             emitProgress(prefix + " " + index + " of " + batch.length + ": " + (variable.label || variable.name));
             const current = gForm.getValue(key);
-            if (isSameFilledValue(current, variable.value, variable.displayValue)) {
+            if (!isMultiRowVariableSet(variable) && isSameFilledValue(current, variable.value, variable.displayValue)) {
               if (isKnownAsyncTriggerVariable(variable) || useDomFirst || isReferenceVariable(variable)) {
                 await triggerDomChangeForVariable(variable);
                 setGFormValue(gForm, key, variable);
                 invokeGFormChangeHandlers(gForm, key, variable, current);
                 await delayAfterVariableChange(variable);
               }
+              logFill("g_form", variable, pass, index, batch.length, "already", {
+                key,
+                currentLength: current != null ? String(current).length : 0,
+              });
               result.alreadySet++;
               handled = true;
               break;
@@ -1429,6 +1520,11 @@ async function fillPortalVariables(variables) {
             await triggerDomChangeForVariable(variable);
             setGFormValue(gForm, key, variable);
             invokeGFormChangeHandlers(gForm, key, variable, current);
+            logFill("g_form", variable, pass, index, batch.length, "filled", {
+              key,
+              currentLength: current != null ? String(current).length : 0,
+              overwriteExisting: !isEmpty(current),
+            });
             result.filled++;
             handled = true;
             await delayAfterVariableChange(variable);
@@ -1441,6 +1537,7 @@ async function fillPortalVariables(variables) {
           const prefix = pass > 1 ? "Retrying" : "Filling";
           emitProgress(prefix + " " + index + " of " + batch.length + ": " + (variable.label || variable.name));
           const domResult = await fillDomVariable(variable);
+          logFill("dom-fallback", variable, pass, index, batch.length, domResult);
           if (domResult === "filled") {
             result.filled++;
             await delayAfterVariableChange(variable);
@@ -1450,6 +1547,9 @@ async function fillPortalVariables(variables) {
             missing.push(variable);
           }
         } catch (e) {
+          logFill("dom-fallback", variable, pass, index, batch.length, "error", {
+            error: String(e && e.message ? e.message : e),
+          });
           if (pass === maxFillPasses) result.skipped++;
           else missing.push(variable);
         }
@@ -1457,14 +1557,26 @@ async function fillPortalVariables(variables) {
       return missing;
     };
 
-    let pending = await fillBatch(values, 1);
+    const batches = splitFillBatches();
+    let pending = await fillBatch(batches.normal, 1);
     for (let pass = 2; pass <= maxFillPasses && pending.length; pass++) {
       emitProgress("Waiting for dependent fields...");
       await sleep(retryDelayMs);
       pending = await fillBatch(pending, pass);
     }
-
     result.unmatched += pending.length;
+
+    if (batches.mrvs.length) {
+      emitProgress("Filling multi-row variable sets...");
+      await sleep(retryDelayMs);
+      let pendingMrvs = await fillBatch(batches.mrvs, 1);
+      for (let pass = 2; pass <= maxFillPasses && pendingMrvs.length; pass++) {
+        emitProgress("Retrying multi-row variable sets...");
+        await sleep(retryDelayMs);
+        pendingMrvs = await fillBatch(pendingMrvs, pass);
+      }
+      result.unmatched += pendingMrvs.length;
+    }
     return result;
   };
 
@@ -1776,6 +1888,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         alreadySet: found ? found.alreadySet || 0 : 0,
         skipped: found ? found.skipped || 0 : 0,
         unmatched: found ? found.unmatched || 0 : 0,
+        fillLog: found && Array.isArray(found.fillLog) ? found.fillLog : [],
         total: variables.length,
       });
     }).catch((error) => {

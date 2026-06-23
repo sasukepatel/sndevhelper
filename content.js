@@ -532,22 +532,37 @@ const UNSUPPORTED_VARIABLE_TYPES = new Set([
   "24",
   "25",
   "31",
-  "33",
-  "attachment",
   "container",
   "container_end",
   "container_start",
   "encrypted",
   "label",
   "macro",
-  "multi_row",
-  "multi_row_variable_set",
   "password",
   "rich_text_label",
 ]);
 
+function normalizeVariableType(type) {
+  return String(type || "").trim().toLowerCase().replace(/\s+/g, "_");
+}
+
+function isAttachmentVariableType(type) {
+  const normalized = normalizeVariableType(type);
+  return normalized === "33" || normalized === "attachment";
+}
+
+function isMultiRowVariableSetType(type) {
+  const normalized = normalizeVariableType(type);
+  return (
+    normalized === "34" ||
+    normalized === "multi_row" ||
+    normalized === "multi_row_variable_set" ||
+    normalized === "multi-row_variable_set"
+  );
+}
+
 function isUnsupportedVariableType(type) {
-  const normalized = String(type || "").trim().toLowerCase().replace(/\s+/g, "_");
+  const normalized = normalizeVariableType(type);
   return normalized && UNSUPPORTED_VARIABLE_TYPES.has(normalized);
 }
 
@@ -563,9 +578,11 @@ function parseVariableOrder(value) {
 function normalizeSourceVariable(row, mapping) {
   const name = snFieldValue(row, mapping.name).trim();
   const value = snFieldValue(row, mapping.value);
-  if (!name || isEmptyPrefillValue(value)) return { variable: null, skipped: 0 };
-
   const type = snFieldValue(row, mapping.type);
+  if (!name) return { variable: null, skipped: 0 };
+  if (isEmptyPrefillValue(value) && !isMultiRowVariableSetType(type)) {
+    return { variable: null, skipped: 0 };
+  }
   if (isUnsupportedVariableType(type)) return { variable: null, skipped: 1 };
   const order = parseVariableOrder(mapping.order ? snFieldValue(row, mapping.order) : "");
 
@@ -578,7 +595,9 @@ function normalizeSourceVariable(row, mapping) {
       displayValue: snFieldDisplay(row, mapping.value),
       order: order.value,
       orderKnown: order.known,
+      sourceSysId: mapping.sysId ? snFieldValue(row, mapping.sysId) : "",
       questionId: mapping.questionId ? snFieldValue(row, mapping.questionId) : "",
+      variableSet: mapping.variableSet ? snFieldValue(row, mapping.variableSet) : "",
       referenceTable:
         (mapping.referenceTable ? snFieldValue(row, mapping.referenceTable) : "") ||
         (mapping.lookupTable ? snFieldValue(row, mapping.lookupTable) : "") ||
@@ -607,12 +626,14 @@ async function fetchCatalogVariables(requestItemId) {
     "sc_item_option_mtom",
     "request_item=" + requestItemId,
     [
+      "sc_item_option.sys_id",
       "sc_item_option.value",
       "sc_item_option.item_option_new",
       "sc_item_option.item_option_new.name",
       "sc_item_option.item_option_new.question_text",
       "sc_item_option.item_option_new.type",
       "sc_item_option.item_option_new.order",
+      "sc_item_option.item_option_new.variable_set",
       "sc_item_option.item_option_new.reference",
       "sc_item_option.item_option_new.lookup_table",
       "sc_item_option.item_option_new.list_table",
@@ -627,7 +648,9 @@ async function fetchCatalogVariables(requestItemId) {
     type: "sc_item_option.item_option_new.type",
     order: "sc_item_option.item_option_new.order",
     value: "sc_item_option.value",
+    sysId: "sc_item_option.sys_id",
     questionId: "sc_item_option.item_option_new",
+    variableSet: "sc_item_option.item_option_new.variable_set",
     referenceTable: "sc_item_option.item_option_new.reference",
     lookupTable: "sc_item_option.item_option_new.lookup_table",
     listTable: "sc_item_option.item_option_new.list_table",
@@ -639,6 +662,7 @@ async function fetchProducerVariables(source) {
   const sysId = typeof source === "string" ? source : source && source.sysId;
   const table = typeof source === "object" && source ? source.table : "";
   const fields = [
+    "sys_id",
     "value",
     "table_name",
     "table_sys_id",
@@ -648,6 +672,7 @@ async function fetchProducerVariables(source) {
     "question.question_text",
     "question.type",
     "question.order",
+    "question.variable_set",
     "question.reference",
     "question.lookup_table",
     "question.list_table",
@@ -675,7 +700,9 @@ async function fetchProducerVariables(source) {
         type: "question.type",
         order: "question.order",
         value: "value",
+        sysId: "sys_id",
         questionId: "question",
+        variableSet: "question.variable_set",
         referenceTable: "question.reference",
         lookupTable: "question.lookup_table",
         listTable: "question.list_table",
@@ -699,11 +726,26 @@ function isListReferenceVariable(variable) {
   return type === "21" || type === "list_collector" || type === "glide_list" || type === "glide-list";
 }
 
+function isAttachmentVariable(variable) {
+  return isAttachmentVariableType((variable && variable.type) || "");
+}
+
+function isMultiRowVariableSet(variable) {
+  return isMultiRowVariableSetType((variable && variable.type) || "");
+}
+
 function splitSysIdList(value) {
   return String(value == null ? "" : value)
     .split(",")
     .map((item) => item.trim())
     .filter(isSysId);
+}
+
+function splitMaybeSysIdList(value) {
+  return String(value == null ? "" : value)
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function bestDisplayValue(row) {
@@ -805,8 +847,211 @@ async function resolveReferenceDisplayValues(variables, onProgress) {
   }
 }
 
+async function resolveAttachmentDisplayValues(variables, onProgress) {
+  const attachmentVariables = Array.from(variables.values()).filter(
+    (variable) => isAttachmentVariable(variable) && splitSysIdList(variable.value).length > 0
+  );
+  if (!attachmentVariables.length) return;
+
+  const ids = [];
+  attachmentVariables.forEach((variable) => {
+    splitSysIdList(variable.value).forEach((id) => {
+      if (ids.indexOf(id) < 0) ids.push(id);
+    });
+  });
+  if (!ids.length) return;
+
+  if (onProgress) onProgress("Resolving attachment names...");
+
+  try {
+    const rows = await snGetMany(
+      "sys_attachment",
+      ids.length === 1 ? "sys_id=" + ids[0] : "sys_idIN" + ids.join(","),
+      "sys_id,file_name,content_type,size_bytes,table_name,table_sys_id",
+      ids.length,
+      { displayAll: true, excludeRefLinks: true }
+    );
+    const byId = {};
+    rows.forEach((row) => {
+      const id = snFieldValue(row, "sys_id");
+      if (!id) return;
+      byId[id] = {
+        sysId: id,
+        fileName: snFieldDisplay(row, "file_name") || id,
+        contentType: snFieldValue(row, "content_type"),
+        sizeBytes: snFieldValue(row, "size_bytes"),
+        tableName: snFieldValue(row, "table_name"),
+        tableSysId: snFieldValue(row, "table_sys_id"),
+      };
+    });
+
+    attachmentVariables.forEach((variable) => {
+      const variableIds = splitMaybeSysIdList(variable.value);
+      const attachments = variableIds.map((id) => byId[id]).filter(Boolean);
+      if (!attachments.length) return;
+      variable.attachments = attachments;
+      variable.displayValue = attachments.map((attachment) => attachment.fileName).join(",");
+    });
+  } catch (e) {
+    /* Keep the raw attachment sys_id if metadata lookup is blocked. */
+  }
+}
+
+function candidateMultiRowParents(source, variables) {
+  const ids = [];
+  const parentById = {};
+  const add = (value, parent) => {
+    if (!isSysId(value)) return;
+    if (ids.indexOf(value) < 0) ids.push(value);
+    if (parent && !parentById[value]) parentById[value] = parent;
+  };
+  add(source && source.requestItemId);
+  add(source && source.sysId);
+  variables.forEach((variable) => {
+    if (!isMultiRowVariableSet(variable)) return;
+    add(variable.sourceSysId, variable);
+    add(variable.questionId, variable);
+    add(variable.variableSet, variable);
+  });
+  return { ids, parentById };
+}
+
+async function fetchMultiRowAnswerRows(parentIds) {
+  const rows = [];
+  const seen = new Set();
+  const queries = [];
+  const fields = [
+    "sys_id",
+    "parent_id",
+    "row_index",
+    "variable_set",
+    "variable_set.name",
+    "variable_set.internal_name",
+    "variable_set.title",
+    "item_option_new",
+    "item_option_new.name",
+    "item_option_new.question_text",
+    "item_option_new.type",
+    "item_option_new.order",
+    "item_option_new.reference",
+    "item_option_new.lookup_table",
+    "item_option_new.list_table",
+    "value",
+  ].join(",");
+
+  for (const parentId of parentIds) {
+    const query = "parent_id=" + parentId;
+    try {
+      const result = await snGetMany("sc_multi_row_question_answer", query, fields, 1000, {
+        displayAll: true,
+        excludeRefLinks: true,
+      });
+      if (result.length) queries.push(query);
+      result.forEach((row) => {
+        row.__queryParentId = parentId;
+        const key =
+          snFieldValue(row, "sys_id") ||
+          [
+            snFieldValue(row, "parent_id"),
+            snFieldValue(row, "variable_set"),
+            snFieldValue(row, "row_index"),
+            snFieldValue(row, "item_option_new"),
+            snFieldValue(row, "value"),
+          ].join(":");
+        if (seen.has(key)) return;
+        seen.add(key);
+        rows.push(row);
+      });
+    } catch (e) {}
+  }
+
+  return { rows, queryUsed: queries.join(" | ") };
+}
+
+function addMultiRowVariablesFromAnswerRows(target, rows, parentById) {
+  if (!rows.length) return 0;
+
+  const parentVariables = Array.from(target.values()).filter(isMultiRowVariableSet);
+  const bySet = {};
+  rows.forEach((row) => {
+    const setId = snFieldValue(row, "variable_set") || "unknown";
+    const queryParent = row.__queryParentId && parentById && parentById[row.__queryParentId];
+    const groupKey = queryParent ? "parent:" + row.__queryParentId : "set:" + setId;
+    if (!bySet[groupKey]) bySet[groupKey] = [];
+    bySet[groupKey].push(row);
+  });
+
+  Object.keys(bySet).forEach((groupKey) => {
+    const answerRows = bySet[groupKey];
+    const first = answerRows[0] || {};
+    const setId = snFieldValue(first, "variable_set") || "unknown";
+    const queryParent = first.__queryParentId && parentById && parentById[first.__queryParentId];
+    const setName =
+      snFieldValue(first, "variable_set.internal_name") ||
+      snFieldValue(first, "variable_set.name") ||
+      setId;
+    const setLabel =
+      snFieldDisplay(first, "variable_set.title") ||
+      snFieldDisplay(first, "variable_set.name") ||
+      setName;
+    const parent =
+      queryParent ||
+      parentVariables.find((variable) => variable.variableSet === setId || variable.questionId === setId) ||
+      parentVariables.find((variable) => variable.name === setName);
+    const name = (parent && parent.name) || setName;
+    if (!name || name === "unknown") return;
+
+    const rowsByIndex = {};
+    const displayRowsByIndex = {};
+    answerRows.forEach((row, answerIndex) => {
+      const rowIndex = snFieldValue(row, "row_index") || String(answerIndex + 1);
+      const columnName =
+        snFieldValue(row, "item_option_new.name") ||
+        snFieldValue(row, "item_option_new") ||
+        "column_" + answerIndex;
+      if (!columnName) return;
+      if (!rowsByIndex[rowIndex]) rowsByIndex[rowIndex] = {};
+      if (!displayRowsByIndex[rowIndex]) displayRowsByIndex[rowIndex] = {};
+      rowsByIndex[rowIndex][columnName] = snFieldValue(row, "value");
+      displayRowsByIndex[rowIndex][columnName] = snFieldDisplay(row, "value");
+    });
+
+    const orderedIndexes = Object.keys(rowsByIndex).sort((a, b) => Number(a) - Number(b));
+    const valueRows = orderedIndexes.map((rowIndex) => rowsByIndex[rowIndex]);
+    const displayRows = orderedIndexes.map((rowIndex) => displayRowsByIndex[rowIndex]);
+    if (!valueRows.length) return;
+
+    target.set(name, {
+      name,
+      label: (parent && parent.label) || setLabel,
+      type: (parent && parent.type) || "multi_row_variable_set",
+      value: JSON.stringify(valueRows),
+      displayValue: JSON.stringify(displayRows),
+      order: parent && Number.isFinite(parent.order) ? parent.order : 0,
+      orderKnown: Boolean(parent && parent.orderKnown),
+      sourceSysId: parent && parent.sourceSysId,
+      questionId: parent && parent.questionId,
+      variableSet: setId,
+      rowCount: valueRows.length,
+      columns: Array.from(
+        new Set(
+          answerRows
+            .map((row) => snFieldValue(row, "item_option_new.name") || snFieldValue(row, "item_option_new"))
+            .filter(Boolean)
+        )
+      ),
+      sourceIndex: parent && Number.isFinite(parent.sourceIndex) ? parent.sourceIndex : target.size,
+    });
+  });
+
+  return Object.keys(bySet).length;
+}
+
 function sortVariablesForFill(variables) {
   return Array.from(variables.values()).sort((a, b) => {
+    const aIsMrvs = isMultiRowVariableSet(a);
+    const bIsMrvs = isMultiRowVariableSet(b);
+    if (aIsMrvs !== bIsMrvs) return aIsMrvs ? 1 : -1;
     if (a.orderKnown !== b.orderKnown) return a.orderKnown ? 1 : -1;
     const orderA = Number.isFinite(a.order) ? a.order : 0;
     const orderB = Number.isFinite(b.order) ? b.order : 0;
@@ -815,6 +1060,9 @@ function sortVariablesForFill(variables) {
     const indexB = Number.isFinite(b.sourceIndex) ? b.sourceIndex : 999999;
     if (indexA !== indexB) return indexA - indexB;
     return String(a.name || "").localeCompare(String(b.name || ""));
+  }).map((variable, index) => {
+    variable.fillOrder = index + 1;
+    return variable;
   });
 }
 
@@ -846,11 +1094,22 @@ async function fetchSourceVariables(source, onProgress) {
     if (source.mode === "producer") hadReadError = true;
   }
 
+  try {
+    const parents = candidateMultiRowParents(source, variables);
+    if (parents.ids.length) {
+      if (onProgress) onProgress("Reading multi-row variable sets...");
+      const mrvs = await fetchMultiRowAnswerRows(parents.ids);
+      if (mrvs.queryUsed) source.multiRowAnswerQuery = mrvs.queryUsed;
+      addMultiRowVariablesFromAnswerRows(variables, mrvs.rows, parents.parentById);
+    }
+  } catch (e) {}
+
   if (!variables.size && hadReadError) {
     throw new Error("Couldn't read variables. Check access to catalog variable tables.");
   }
 
   await resolveReferenceDisplayValues(variables, onProgress);
+  await resolveAttachmentDisplayValues(variables, onProgress);
 
   return { variables: sortVariablesForFill(variables), skipped };
 }
@@ -876,6 +1135,7 @@ async function prefillPortalVariablesFromTicket(input) {
       number: source.number,
       requestItemId: source.requestItemId,
       producerAnswerQuery: source.producerAnswerQuery,
+      multiRowAnswerQuery: source.multiRowAnswerQuery,
     };
     if (!variables.length) {
       const suffix = sourceResult.skipped ? " (" + sourceResult.skipped + " unsupported)" : "";
@@ -928,13 +1188,21 @@ async function copyPortalVariableDebugInfo() {
       sourceInfo: SNH.lastPrefillSource,
       fillResult: SNH.lastPrefillResult,
       sourceVariables: SNH.lastPrefillVariables.map((variable) => ({
+        fillOrder: variable.fillOrder,
         name: variable.name,
         label: variable.label,
         type: variable.type,
+        questionOrder: variable.order,
+        orderKnown: variable.orderKnown,
         questionId: variable.questionId,
+        variableSet: variable.variableSet,
         referenceTable: variable.referenceTable,
         valueLength: variable.value ? String(variable.value).length : 0,
         displayValue: variable.displayValue,
+        rowCount: variable.rowCount,
+        attachmentNames: Array.isArray(variable.attachments)
+          ? variable.attachments.map((attachment) => attachment.fileName)
+          : undefined,
       })),
       frames: resp.frames || [],
     };
