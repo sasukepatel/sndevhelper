@@ -131,8 +131,10 @@ async function fillPortalVariables(variables) {
   const choiceFillDelayMs = 150;
   const referenceFillDelayMs = 400;
   const triggerReferenceDelayMs = 1000;
+  const nativeVerificationDelayMs = 150;
+  const nativeVerificationAttempts = 3;
   const retryDelayMs = 250;
-  const maxFillPasses = 2;
+  const maxFillPasses = 3;
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -457,11 +459,6 @@ async function fillPortalVariables(variables) {
     return container.querySelector("input.select2-input") || el;
   };
 
-  const isCheckboxVariable = (variable) => {
-    const type = normalizeVariableType((variable && variable.type) || "");
-    return type === "7" || type === "boolean" || type === "checkbox" || type === "checkbox_container";
-  };
-
   const isAttachmentVariable = (variable) => {
     const type = normalizeVariableType((variable && variable.type) || "");
     return type === "33" || type === "attachment";
@@ -499,14 +496,15 @@ async function fillPortalVariables(variables) {
       isMrvs: Boolean(isMultiRowVariableSet(variable)),
       questionOrder: variable && variable.order,
       orderKnown: Boolean(variable && variable.orderKnown),
+      effectiveOrder: variable && variable.effectiveOrder,
+      effectiveOrderKnown: Boolean(variable && variable.effectiveOrderKnown),
+      variableSetOrder: variable && variable.variableSetOrder,
+      variableSetOrderKnown: Boolean(variable && variable.variableSetOrderKnown),
       rowCount: variable && variable.rowCount,
       valueLength: variable && variable.value != null ? String(variable.value).length : 0,
       displayValueLength: variable && variable.displayValue != null ? String(variable.displayValue).length : 0,
     }, details || {}));
   };
-
-  const isDomFirstVariable = (variable) =>
-    isCheckboxVariable(variable) || isGlideListVariable(variable);
 
   const isChoiceLikeVariable = (variable) => {
     const type = String((variable && variable.type) || "").trim().toLowerCase();
@@ -1361,6 +1359,288 @@ async function fillPortalVariables(variables) {
     return container.querySelector("input:not([type='hidden']),textarea,select,[contenteditable='true']");
   };
 
+  const findGFormTarget = (gForm, variable) => {
+    if (!gForm || !variable) return null;
+    const keys = variableKeys(variable);
+    for (const key of keys) {
+      let field = null;
+      try {
+        if (typeof gForm.getField === "function") field = gForm.getField(key);
+      } catch (e) {}
+      try {
+        if (!field && typeof gForm.getGlideUIElement === "function") {
+          field = gForm.getGlideUIElement(key);
+        }
+      } catch (e) {}
+      if (field) return { key, field };
+    }
+
+    for (const key of keys) {
+      try {
+        const current = gForm.getValue(key);
+        if (current !== undefined && current !== null) return { key, field: null };
+      } catch (e) {}
+    }
+    return null;
+  };
+
+  const targetFieldType = (target, variable) =>
+    normalizeVariableType(
+      (target && target.field &&
+        (target.field.type || target.field.display_type || target.field.fieldType)) ||
+      (variable && variable.type) ||
+      ""
+    );
+
+  const isReferenceLikeTarget = (target, variable) => {
+    const type = targetFieldType(target, variable);
+    return (
+      type === "8" ||
+      type === "21" ||
+      type === "reference" ||
+      type === "glide_list" ||
+      type === "glide-list" ||
+      type === "list_collector"
+    );
+  };
+
+  const isListTarget = (target, variable) => {
+    const type = targetFieldType(target, variable);
+    return (
+      type === "21" ||
+      type === "glide_list" ||
+      type === "glide-list" ||
+      type === "list_collector"
+    );
+  };
+
+  const sameStoredRecordValue = (current, expected, isList) => {
+    if (!isList) return sameValue(current, expected);
+    const currentValues = splitListValue(current).map(normalizeComparable).sort();
+    const expectedValues = splitListValue(expected).map(normalizeComparable).sort();
+    return (
+      currentValues.length === expectedValues.length &&
+      currentValues.every((value, index) => value === expectedValues[index])
+    );
+  };
+
+  const nativeDisplayState = (gForm, target, variable, isList) => {
+    const expected = String(
+      variable && variable.displayValue != null ? variable.displayValue : ""
+    ).trim();
+    const rawValue = String(variable && variable.value != null ? variable.value : "").trim();
+    if (!expected || sameValue(expected, rawValue)) return "unknown";
+
+    const candidates = [];
+    const addCandidate = (value) => {
+      const text = String(value == null ? "" : value).trim();
+      if (text && candidates.indexOf(text) < 0) candidates.push(text);
+    };
+
+    try {
+      if (gForm && typeof gForm.getDisplayValue === "function") {
+        addCandidate(gForm.getDisplayValue(target.key));
+      }
+    } catch (e) {}
+    if (target.field) {
+      addCandidate(target.field.display_value);
+      addCandidate(target.field.displayValue);
+      addCandidate(target.field.display_value_list);
+    }
+
+    const el = findDomField(variable);
+    const container = select2ContainerForElement(el);
+    try {
+      if (container) {
+        const chosen = container.querySelector(".select2-chosen");
+        if (chosen) addCandidate(visibleText(chosen));
+        const choiceLabels = Array.from(
+          container.querySelectorAll(".select2-search-choice")
+        ).map(visibleText).filter(Boolean);
+        if (choiceLabels.length) addCandidate(choiceLabels.join(","));
+      }
+    } catch (e) {}
+
+    if (!candidates.length) return "unknown";
+    if (!isList) {
+      return candidates.some((candidate) =>
+        sameValue(candidate, expected) ||
+        normalizeComparable(candidate).indexOf(normalizeComparable(expected)) >= 0
+      ) ? "match" : "mismatch";
+    }
+
+    const expectedLabels = splitListValue(expected).map(normalizeComparable);
+    const visibleLabels = normalizeComparable(candidates.join(" | "));
+    return expectedLabels.every((label) => label && visibleLabels.indexOf(label) >= 0)
+      ? "match"
+      : "mismatch";
+  };
+
+  const setNativeReferenceValue = async (gForm, target, variable) => {
+    if (!gForm || !target || !target.key) return false;
+    const expected = String(variable && variable.value != null ? variable.value : "");
+    const listTarget = isListTarget(target, variable);
+    try {
+      // Let the portal's own GlideForm/widget pipeline resolve and render
+      // reference labels before falling back to direct Select2/DOM handling.
+      gForm.setValue(target.key, expected);
+    } catch (e) {
+      return false;
+    }
+
+    for (let attempt = 0; attempt < nativeVerificationAttempts; attempt++) {
+      await sleep(nativeVerificationDelayMs);
+      let current = "";
+      try {
+        current = gForm.getValue(target.key);
+      } catch (e) {}
+      const valueMatches = sameStoredRecordValue(current, expected, listTarget);
+      const displayState = nativeDisplayState(gForm, target, variable, listTarget);
+      if (valueMatches && displayState !== "mismatch") return true;
+    }
+    return false;
+  };
+
+  const isChoiceTarget = (target, variable) => {
+    const type = targetFieldType(target, variable);
+    return (
+      type === "3" ||
+      type === "5" ||
+      type === "18" ||
+      type === "choice" ||
+      type === "multiple_choice" ||
+      type === "select_box"
+    );
+  };
+
+  const isBooleanTarget = (target, variable) => {
+    const type = targetFieldType(target, variable);
+    return (
+      type === "7" ||
+      type === "boolean" ||
+      type === "checkbox" ||
+      type === "checkbox_container"
+    );
+  };
+
+  const isDateTarget = (target, variable) => {
+    const type = targetFieldType(target, variable);
+    return type.indexOf("date") >= 0;
+  };
+
+  const normalizedBooleanValue = (value) =>
+    ["true", "1", "yes", "y", "on"].indexOf(
+      String(value == null ? "" : value).trim().toLowerCase()
+    ) >= 0
+      ? "true"
+      : "false";
+
+  const nativeVariableForTarget = (target, variable) => {
+    const nativeVariable = Object.assign({}, variable);
+    if (isBooleanTarget(target, variable)) {
+      nativeVariable.value = normalizedBooleanValue(variable.value);
+      nativeVariable.displayValue = nativeVariable.value;
+      return nativeVariable;
+    }
+    if (!isChoiceTarget(target, variable)) return nativeVariable;
+
+    const choices =
+      (target && target.field && Array.isArray(target.field.choices)
+        ? target.field.choices
+        : []);
+    const aliasValue = aliasedChoiceValue(variable, variable.value);
+    const match =
+      findChoiceMatch(choices, aliasValue || variable.value, variable.displayValue) ||
+      (aliasValue ? findChoiceMatch(choices, aliasValue, aliasValue) : null);
+    if (match) {
+      nativeVariable.value = String(match.value);
+      nativeVariable.displayValue = String(
+        match.display_value ||
+        match.label ||
+        match.text ||
+        variable.displayValue ||
+        match.value
+      );
+    } else if (aliasValue) {
+      nativeVariable.value = aliasValue;
+    }
+    return nativeVariable;
+  };
+
+  const nativeBooleanDomState = (variable, expected) => {
+    const el = findDomField(variable);
+    if (!el || el.type !== "checkbox") return "unknown";
+    return el.checked === (normalizedBooleanValue(expected) === "true")
+      ? "match"
+      : "mismatch";
+  };
+
+  const nativeStandardValueMatches = (current, target, variable) => {
+    if (isBooleanTarget(target, variable)) {
+      if (isEmpty(current)) return false;
+      return normalizedBooleanValue(current) === normalizedBooleanValue(variable.value);
+    }
+    return sameValue(current, variable.value);
+  };
+
+  const setNativeStandardValue = async (gForm, target, variable) => {
+    if (!gForm || !target || !target.key) return false;
+    const verifyDelay = isChoiceTarget(target, variable)
+      ? choiceFillDelayMs
+      : isBooleanTarget(target, variable)
+        ? 100
+        : Math.max(simpleFillDelayMs, 50);
+
+    const setAndVerify = async (clearFirst) => {
+      try {
+        if (clearFirst) {
+          gForm.setValue(target.key, "");
+          await sleep(simpleFillDelayMs);
+        }
+        gForm.setValue(target.key, variable.value);
+      } catch (e) {
+        return false;
+      }
+
+      for (let attempt = 0; attempt < nativeVerificationAttempts; attempt++) {
+        await sleep(verifyDelay);
+        let current = "";
+        try {
+          current = gForm.getValue(target.key);
+        } catch (e) {}
+        if (!nativeStandardValueMatches(current, target, variable)) continue;
+        if (
+          isBooleanTarget(target, variable) &&
+          nativeBooleanDomState(variable, variable.value) === "mismatch"
+        ) {
+          continue;
+        }
+        return true;
+      }
+      return false;
+    };
+
+    if (await setAndVerify(false)) return true;
+    return isDateTarget(target, variable) ? setAndVerify(true) : false;
+  };
+
+  const variableNeedsRefill = (gForm, variable) => {
+    const expected = String(variable && variable.value != null ? variable.value : "");
+    if (!expected) return false;
+    const target = findGFormTarget(gForm, variable);
+    if (!target) return false;
+    let current = "";
+    try {
+      current = gForm.getValue(target.key);
+    } catch (e) {
+      return false;
+    }
+    if (isReferenceLikeTarget(target, variable)) {
+      return !sameStoredRecordValue(current, expected, isListTarget(target, variable));
+    }
+    return isEmpty(current);
+  };
+
   const fillDomVariable = async (variable) => {
     const el = findDomField(variable);
     if (!el) return "missing";
@@ -1377,13 +1657,6 @@ async function fillPortalVariables(variables) {
     }
     if (!(await setElementValue(el, variable))) return "missing";
     return "filled";
-  };
-
-  const isTargetGlideListVariable = (variable) => {
-    const el = findDomField(variable);
-    if (!el) return false;
-    return isSelect2MultiElement(el) ||
-      findAngularFieldScopes(el, variable).some((candidate) => candidate && isGlideListField(candidate.field));
   };
 
   const triggerDomChangeForVariable = async (variable) => {
@@ -1476,23 +1749,141 @@ async function fillPortalVariables(variables) {
           continue;
         }
 
-        const useDomFirst = isDomFirstVariable(variable) || isTargetGlideListVariable(variable);
-        if (useDomFirst) {
+        const target = findGFormTarget(gForm, variable);
+        const nativeReferenceLike = isReferenceLikeTarget(target, variable);
+        if (nativeReferenceLike) {
+          const prefix = pass > 1 ? "Retrying" : "Filling";
+          emitProgress(prefix + " " + index + " of " + batch.length + ": " + (variable.label || variable.name));
           try {
-            const prefix = pass > 1 ? "Retrying" : "Filling";
-            emitProgress(prefix + " " + index + " of " + batch.length + ": " + (variable.label || variable.name));
-            const domResult = await fillDomVariable(variable);
-            logFill("dom-first", variable, pass, index, batch.length, domResult);
-            if (domResult === "filled") {
+            let current = "";
+            try {
+              current = target ? gForm.getValue(target.key) : "";
+            } catch (e) {}
+            const listTarget = isListTarget(target, variable);
+            const alreadyStored =
+              target &&
+              sameStoredRecordValue(current, variable.value, listTarget);
+            const displayState = target
+              ? nativeDisplayState(gForm, target, variable, listTarget)
+              : "unknown";
+
+            if (alreadyStored && displayState !== "mismatch") {
+              logFill("native-g_form", variable, pass, index, batch.length, "already", {
+                key: target.key,
+                displayState,
+              });
+              result.alreadySet++;
+              continue;
+            }
+
+            if (await setNativeReferenceValue(gForm, target, variable)) {
+              logFill("native-g_form", variable, pass, index, batch.length, "filled", {
+                key: target && target.key,
+                displayState: target
+                  ? nativeDisplayState(gForm, target, variable, listTarget)
+                  : "unknown",
+                overwriteExisting: !isEmpty(current),
+              });
               result.filled++;
               await delayAfterVariableChange(variable);
               continue;
             }
-            if (domResult === "already") {
+
+            logFill("native-g_form", variable, pass, index, batch.length, "fallback", {
+              key: target && target.key,
+              reason: target ? "native_value_or_display_not_settled" : "target_field_not_found",
+            });
+            const domResult = await fillDomVariable(variable);
+            logFill("dom-fallback", variable, pass, index, batch.length, domResult, {
+              reason: "native_reference_fallback",
+            });
+            if (domResult === "filled" || domResult === "already") {
+              if (domResult === "filled") {
+                result.filled++;
+                await delayAfterVariableChange(variable);
+              } else {
+                result.alreadySet++;
+              }
+            } else {
+              missing.push(variable);
+            }
+          } catch (e) {
+            logFill("native-g_form", variable, pass, index, batch.length, "error", {
+              error: String(e && e.message ? e.message : e),
+            });
+            if (pass === maxFillPasses) result.skipped++;
+            else missing.push(variable);
+          }
+          continue;
+        }
+
+        const isComplexVariable =
+          isAttachmentVariable(variable) || isMultiRowVariableSet(variable);
+        if (!isComplexVariable) {
+          const prefix = pass > 1 ? "Retrying" : "Filling";
+          emitProgress(prefix + " " + index + " of " + batch.length + ": " + (variable.label || variable.name));
+          const nativeVariable = nativeVariableForTarget(target, variable);
+          try {
+            let current = "";
+            try {
+              current = target ? gForm.getValue(target.key) : "";
+            } catch (e) {}
+            const alreadyStored =
+              target &&
+              nativeStandardValueMatches(current, target, nativeVariable);
+            const booleanDomState = isBooleanTarget(target, nativeVariable)
+              ? nativeBooleanDomState(variable, nativeVariable.value)
+              : "unknown";
+
+            if (alreadyStored && booleanDomState !== "mismatch") {
+              logFill("native-g_form", variable, pass, index, batch.length, "already", {
+                key: target.key,
+                targetType: targetFieldType(target, nativeVariable),
+                resolvedValue: nativeVariable.value,
+                booleanDomState,
+              });
               result.alreadySet++;
               continue;
             }
-          } catch (e) {}
+
+            if (await setNativeStandardValue(gForm, target, nativeVariable)) {
+              logFill("native-g_form", variable, pass, index, batch.length, "filled", {
+                key: target && target.key,
+                targetType: targetFieldType(target, nativeVariable),
+                resolvedValue: nativeVariable.value,
+                overwriteExisting: !isEmpty(current),
+              });
+              result.filled++;
+              await delayAfterVariableChange(variable);
+              continue;
+            }
+
+            logFill("native-g_form", variable, pass, index, batch.length, "fallback", {
+              key: target && target.key,
+              targetType: targetFieldType(target, nativeVariable),
+              reason: target ? "native_value_or_widget_not_settled" : "target_field_not_found",
+            });
+            const domResult = await fillDomVariable(nativeVariable);
+            logFill("dom-fallback", variable, pass, index, batch.length, domResult, {
+              reason: "native_standard_fallback",
+              resolvedValue: nativeVariable.value,
+            });
+            if (domResult === "filled") {
+              result.filled++;
+              await delayAfterVariableChange(variable);
+            } else if (domResult === "already") {
+              result.alreadySet++;
+            } else {
+              missing.push(variable);
+            }
+          } catch (e) {
+            logFill("native-g_form", variable, pass, index, batch.length, "error", {
+              error: String(e && e.message ? e.message : e),
+            });
+            if (pass === maxFillPasses) result.skipped++;
+            else missing.push(variable);
+          }
+          continue;
         }
 
         let handled = false;
@@ -1502,7 +1893,7 @@ async function fillPortalVariables(variables) {
             emitProgress(prefix + " " + index + " of " + batch.length + ": " + (variable.label || variable.name));
             const current = gForm.getValue(key);
             if (!isMultiRowVariableSet(variable) && isSameFilledValue(current, variable.value, variable.displayValue)) {
-              if (isKnownAsyncTriggerVariable(variable) || useDomFirst || isReferenceVariable(variable)) {
+              if (isKnownAsyncTriggerVariable(variable) || isReferenceVariable(variable)) {
                 await triggerDomChangeForVariable(variable);
                 setGFormValue(gForm, key, variable);
                 invokeGFormChangeHandlers(gForm, key, variable, current);
@@ -1557,12 +1948,35 @@ async function fillPortalVariables(variables) {
       return missing;
     };
 
+    const mergeVariables = (...groups) => {
+      const merged = [];
+      groups.forEach((group) => {
+        (group || []).forEach((variable) => {
+          if (variable && merged.indexOf(variable) < 0) merged.push(variable);
+        });
+      });
+      return merged.sort((a, b) => {
+        const orderA = Number.isFinite(a && a.fillOrder) ? a.fillOrder : 999999;
+        const orderB = Number.isFinite(b && b.fillOrder) ? b.fillOrder : 999999;
+        return orderA - orderB;
+      });
+    };
+
     const batches = splitFillBatches();
     let pending = await fillBatch(batches.normal, 1);
+
+    pending = mergeVariables(
+      pending,
+      batches.normal.filter((variable) => variableNeedsRefill(gForm, variable))
+    );
     for (let pass = 2; pass <= maxFillPasses && pending.length; pass++) {
-      emitProgress("Waiting for dependent fields...");
+      emitProgress("Re-validating fields changed by onChange scripts...");
       await sleep(retryDelayMs);
-      pending = await fillBatch(pending, pass);
+      const retryFailures = await fillBatch(pending, pass);
+      pending = mergeVariables(
+        retryFailures,
+        batches.normal.filter((variable) => variableNeedsRefill(gForm, variable))
+      );
     }
     result.unmatched += pending.length;
 
