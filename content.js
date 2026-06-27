@@ -1102,15 +1102,98 @@ function addMultiRowVariablesFromAnswerRows(target, rows, parentById) {
   return Object.keys(bySet).length;
 }
 
+function currentCatalogItemDefinitionSysId() {
+  try {
+    const url = new URL(location.href);
+    const sysId = url.searchParams.get("sys_id");
+    if (isSysId(sysId)) return sysId;
+  } catch (e) {}
+
+  try {
+    const el = document.querySelector(
+      "[cat-item-sys-id],[data-item-sys-id],[data-sys-id]"
+    );
+    const sysId =
+      (el &&
+        (el.getAttribute("cat-item-sys-id") ||
+          el.getAttribute("data-item-sys-id") ||
+          el.getAttribute("data-sys-id"))) ||
+      "";
+    if (isSysId(sysId)) return sysId;
+  } catch (e) {}
+  return "";
+}
+
+async function applyVariableSetPlacementOrder(variables, catalogItemSysId, onProgress) {
+  variables.forEach((variable) => {
+    variable.variableSetOrder = 0;
+    variable.variableSetOrderKnown = false;
+    variable.effectiveOrder = variable.order;
+    variable.effectiveOrderKnown = variable.orderKnown;
+  });
+
+  if (!isSysId(catalogItemSysId)) return;
+  const setIds = Array.from(
+    new Set(
+      Array.from(variables.values())
+        .map((variable) => String(variable.variableSet || "").trim())
+        .filter(isSysId)
+    )
+  );
+  if (!setIds.length) return;
+  if (onProgress) onProgress("Resolving variable set placement order...");
+
+  try {
+    const rows = await snGetMany(
+      "io_set_item",
+      "sc_cat_item=" + catalogItemSysId + "^variable_setIN" + setIds.join(","),
+      "variable_set,order",
+      setIds.length,
+      { displayAll: true, excludeRefLinks: true }
+    );
+    const placementBySet = {};
+    rows.forEach((row) => {
+      const setId = snFieldValue(row, "variable_set");
+      const placement = parseVariableOrder(snFieldValue(row, "order"));
+      if (isSysId(setId) && placement.known) {
+        placementBySet[setId] = placement.value;
+      }
+    });
+
+    variables.forEach((variable) => {
+      const setId = String(variable.variableSet || "").trim();
+      if (!Object.prototype.hasOwnProperty.call(placementBySet, setId)) return;
+      variable.variableSetOrder = placementBySet[setId];
+      variable.variableSetOrderKnown = true;
+      variable.effectiveOrder = placementBySet[setId];
+      variable.effectiveOrderKnown = true;
+    });
+  } catch (e) {
+    /* Fall back to each child variable's own order if io_set_item is unavailable. */
+  }
+}
+
 function sortVariablesForFill(variables) {
   return Array.from(variables.values()).sort((a, b) => {
     const aIsMrvs = isMultiRowVariableSet(a);
     const bIsMrvs = isMultiRowVariableSet(b);
     if (aIsMrvs !== bIsMrvs) return aIsMrvs ? 1 : -1;
-    if (a.orderKnown !== b.orderKnown) return a.orderKnown ? -1 : 1;
-    const orderA = Number.isFinite(a.order) ? a.order : 0;
-    const orderB = Number.isFinite(b.order) ? b.order : 0;
+    if (a.effectiveOrderKnown !== b.effectiveOrderKnown) {
+      return a.effectiveOrderKnown ? -1 : 1;
+    }
+    const orderA = Number.isFinite(a.effectiveOrder) ? a.effectiveOrder : 0;
+    const orderB = Number.isFinite(b.effectiveOrder) ? b.effectiveOrder : 0;
     if (orderA !== orderB) return orderA - orderB;
+    if (
+      a.variableSet &&
+      b.variableSet &&
+      a.variableSet === b.variableSet
+    ) {
+      if (a.orderKnown !== b.orderKnown) return a.orderKnown ? -1 : 1;
+      const innerOrderA = Number.isFinite(a.order) ? a.order : 0;
+      const innerOrderB = Number.isFinite(b.order) ? b.order : 0;
+      if (innerOrderA !== innerOrderB) return innerOrderA - innerOrderB;
+    }
     const indexA = Number.isFinite(a.sourceIndex) ? a.sourceIndex : 999999;
     const indexB = Number.isFinite(b.sourceIndex) ? b.sourceIndex : 999999;
     if (indexA !== indexB) return indexA - indexB;
@@ -1163,6 +1246,11 @@ async function fetchSourceVariables(source, onProgress) {
     throw new Error("Couldn't read variables. Check access to catalog variable tables.");
   }
 
+  await applyVariableSetPlacementOrder(
+    variables,
+    currentCatalogItemDefinitionSysId(),
+    onProgress
+  );
   await resolveReferenceDisplayValues(variables, onProgress);
   await resolveAttachmentDisplayValues(variables, onProgress);
 
@@ -1249,8 +1337,12 @@ async function copyPortalVariableDebugInfo() {
         type: variable.type,
         questionOrder: variable.order,
         orderKnown: variable.orderKnown,
+        effectiveOrder: variable.effectiveOrder,
+        effectiveOrderKnown: variable.effectiveOrderKnown,
         questionId: variable.questionId,
         variableSet: variable.variableSet,
+        variableSetOrder: variable.variableSetOrder,
+        variableSetOrderKnown: variable.variableSetOrderKnown,
         referenceTable: variable.referenceTable,
         referenceDisplayField: variable.referenceDisplayField,
         valueLength: variable.value ? String(variable.value).length : 0,
