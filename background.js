@@ -54,7 +54,7 @@ function extractSysId() {
       );
       if (workspaceMatch) return workspaceMatch[1];
 
-      const match = value.match(/(?:[?&]sys_id=|sys_id=)([0-9a-f]{32})/i);
+      const match = value.match(/(?:[?&]sys_?id=|sys_?id=)([0-9a-f]{32})/i);
       if (match) return match[1];
       try {
         const decoded = decodeURIComponent(value);

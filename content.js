@@ -1243,7 +1243,7 @@ function sysIdFromText(text) {
     );
     if (workspaceMatch) return workspaceMatch[1];
 
-    const match = value.match(/(?:[?&]sys_id=|sys_id=)([0-9a-f]{32})/i);
+    const match = value.match(/(?:[?&]sys_?id=|sys_?id=)([0-9a-f]{32})/i);
     if (match) return match[1];
     try {
       const decoded = decodeURIComponent(value);
@@ -1254,6 +1254,62 @@ function sysIdFromText(text) {
     }
   }
   return null;
+}
+
+async function getCurrentRecordSysId() {
+  const localId = sysIdFromText(location.href);
+  if (localId) return localId;
+  const resp = await chrome.runtime.sendMessage({ type: "GET_SYS_ID" });
+  return resp && resp.sysId ? resp.sysId : null;
+}
+
+function recordSysIdFromInput(input) {
+  const text = String(input || "").trim();
+  const sysId = sysIdFromText(text) || (isSysId(text) ? text : null);
+  return sysId ? sysId.toLowerCase() : null;
+}
+
+function openCustomerUpdatesBySysId(input) {
+  const sysId = recordSysIdFromInput(input);
+  if (!sysId) {
+    throw new Error("Enter a valid 32-character sys_id.");
+  }
+  openList("sys_update_xml", "category=customer^nameLIKE" + sysId);
+}
+
+async function openCurrentPlaybookCustomerUpdates() {
+  const sysId = await getCurrentRecordSysId();
+  if (!isSysId(sysId)) {
+    throw new Error("No playbook sys_id found in the current page.");
+  }
+  openList(
+    "sys_update_xml",
+    "category=customer^name=sys_pd_process_definition_" + sysId.toLowerCase()
+  );
+}
+
+function openPlaybookExecutionsBySysId(input) {
+  const sysId = recordSysIdFromInput(input);
+  if (!sysId) {
+    throw new Error("Enter a valid 32-character sys_id.");
+  }
+  openList("sys_pd_context", "input_record=" + sysId);
+  closePalette();
+}
+
+async function openCurrentRecordPlaybookExecutions() {
+  const sysId = await getCurrentRecordSysId();
+  if (!isSysId(sysId)) {
+    showArgInput({
+      id: "open-playbook-executions-by-sysid",
+      name: "Open playbook executions",
+      placeholder: "record sys_id or ServiceNow record URL",
+      keepOpen: true,
+      run: openPlaybookExecutionsBySysId,
+    });
+    return;
+  }
+  openPlaybookExecutionsBySysId(sysId);
 }
 
 async function openLabelTranslations(formTable, field) {
@@ -1384,6 +1440,9 @@ const DEV_LINKS = [
 function buildCommands() {
   const navTo = (path) =>
     chrome.runtime.sendMessage({ type: "OPEN_URL", url: location.origin + path });
+  const isPlaybookDefinitionPage = decodedVariants(location.href).some(
+    (url) => url.includes("sys_pd_process_definition")
+  );
 
   const cmds = [
     {
@@ -1408,9 +1467,7 @@ function buildCommands() {
       group: "Record",
       keepOpen: true,
       run: async () => {
-        const localId = sysIdFromText(location.href);
-        const resp = localId ? null : await chrome.runtime.sendMessage({ type: "GET_SYS_ID" });
-        const id = localId || (resp && resp.sysId);
+        const id = await getCurrentRecordSysId();
         if (id) {
           try {
             await copyText(id);
@@ -1422,6 +1479,34 @@ function buildCommands() {
           showToast("No record sys_id found", true);
         }
       },
+    },
+    {
+      id: "open-playbook-executions",
+      name: "Open playbook executions",
+      keywords: ["playbook", "execution", "executions", "process automation", "pad", "sys_pd_context", "input_record"],
+      group: "Record",
+      keepOpen: true,
+      run: openCurrentRecordPlaybookExecutions,
+    },
+    ...(isPlaybookDefinitionPage
+      ? [{
+          id: "open-current-playbook-customer-updates",
+          name: "Open current playbook customer updates",
+          keywords: ["playbook", "customer update", "update xml", "sys_update_xml", "process definition"],
+          group: "Record",
+          keepOpen: true,
+          run: openCurrentPlaybookCustomerUpdates,
+        }]
+      : []),
+    {
+      id: "open-customer-updates-by-sysid",
+      name: "Open customer updates by sys_id...",
+      keywords: ["customer update", "update xml", "sys_update_xml", "sys_id", "record"],
+      group: "Record",
+      input: true,
+      placeholder: "record sys_id or ServiceNow record URL",
+      keepOpen: true,
+      run: openCustomerUpdatesBySysId,
     },
     {
       id: "prefill-variables",
