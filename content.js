@@ -1107,7 +1107,7 @@ function sortVariablesForFill(variables) {
     const aIsMrvs = isMultiRowVariableSet(a);
     const bIsMrvs = isMultiRowVariableSet(b);
     if (aIsMrvs !== bIsMrvs) return aIsMrvs ? 1 : -1;
-    if (a.orderKnown !== b.orderKnown) return a.orderKnown ? 1 : -1;
+    if (a.orderKnown !== b.orderKnown) return a.orderKnown ? -1 : 1;
     const orderA = Number.isFinite(a.order) ? a.order : 0;
     const orderB = Number.isFinite(b.order) ? b.order : 0;
     if (orderA !== orderB) return orderA - orderB;

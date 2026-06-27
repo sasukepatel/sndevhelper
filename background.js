@@ -131,7 +131,6 @@ async function fillPortalVariables(variables) {
   const choiceFillDelayMs = 150;
   const referenceFillDelayMs = 400;
   const triggerReferenceDelayMs = 1000;
-  const dependencySettleDelayMs = 1000;
   const nativeVerificationDelayMs = 150;
   const nativeVerificationAttempts = 3;
   const retryDelayMs = 250;
@@ -1411,42 +1410,6 @@ async function fillPortalVariables(variables) {
     );
   };
 
-  const targetHasDynamicDependency = (target, variable) => {
-    if (!target || !target.field || !isReferenceLikeTarget(target, variable)) return false;
-    const field = target.field;
-    const ed = field.ed || field.elementDescriptor || {};
-    const dependent = [
-      field.dependentField,
-      field.dependent_field,
-      field.reference_qual_elements,
-      ed.dependentField,
-      ed.dependent_field,
-      ed.reference_qual_elements,
-    ].filter(Boolean);
-    if (dependent.length) return true;
-
-    const qualifier = [
-      field.qualifier,
-      field.ref_qual,
-      field.reference_qual,
-      ed.qualifier,
-      ed.ref_qual,
-      ed.reference_qual,
-      ed.attributes,
-    ].filter(Boolean).join(" ");
-    return /javascript:|current\.|VALOF|ref_qual_elements|dependent/i.test(qualifier);
-  };
-
-  const splitByTargetDependency = (gForm, batch) => {
-    const independent = [];
-    const dependent = [];
-    batch.forEach((variable) => {
-      const target = findGFormTarget(gForm, variable);
-      (targetHasDynamicDependency(target, variable) ? dependent : independent).push(variable);
-    });
-    return { independent, dependent };
-  };
-
   const sameStoredRecordValue = (current, expected, isList) => {
     if (!isList) return sameValue(current, expected);
     const currentValues = splitListValue(current).map(normalizeComparable).sort();
@@ -1988,23 +1951,15 @@ async function fillPortalVariables(variables) {
           if (variable && merged.indexOf(variable) < 0) merged.push(variable);
         });
       });
-      return merged;
+      return merged.sort((a, b) => {
+        const orderA = Number.isFinite(a && a.fillOrder) ? a.fillOrder : 999999;
+        const orderB = Number.isFinite(b && b.fillOrder) ? b.fillOrder : 999999;
+        return orderA - orderB;
+      });
     };
 
     const batches = splitFillBatches();
-    const dependencyBatches = splitByTargetDependency(gForm, batches.normal);
-    let pending = await fillBatch(dependencyBatches.independent, 1);
-
-    if (dependencyBatches.dependent.length) {
-      emitProgress("Waiting for reference dependencies...");
-      await sleep(dependencySettleDelayMs);
-      const reclassified = splitByTargetDependency(gForm, dependencyBatches.dependent);
-      const dependentPending = await fillBatch(
-        reclassified.independent.concat(reclassified.dependent),
-        1
-      );
-      pending = mergeVariables(pending, dependentPending);
-    }
+    let pending = await fillBatch(batches.normal, 1);
 
     pending = mergeVariables(
       pending,
