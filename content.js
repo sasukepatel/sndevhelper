@@ -748,20 +748,69 @@ function splitMaybeSysIdList(value) {
     .filter(Boolean);
 }
 
-function bestDisplayValue(row) {
-  const displayFields = [
-    "name",
-    "number",
-    "display_name",
-    "title",
-    "short_description",
-    "u_name",
-    "u_display_name",
-    "u_site_name",
-    "u_location_name",
-    "u_label",
-    "street",
-  ];
+const FALLBACK_DISPLAY_FIELDS = [
+  "name",
+  "number",
+  "display_name",
+  "title",
+  "short_description",
+  "u_name",
+  "u_display_name",
+  "u_site_name",
+  "u_location_name",
+  "u_label",
+  "street",
+  "city",
+  "state",
+];
+const tableDisplayFieldCache = new Map();
+
+async function resolveTableDisplayField(table) {
+  const tableName = String(table || "").trim();
+  if (!/^[a-z][a-z0-9_]*$/i.test(tableName)) return "";
+  if (tableDisplayFieldCache.has(tableName)) {
+    return tableDisplayFieldCache.get(tableName);
+  }
+
+  let current = tableName;
+  let displayField = "";
+  try {
+    for (let hop = 0; hop < 8 && current; hop++) {
+      const dictionaries = await snGetMany(
+        "sys_dictionary",
+        "name=" + current + "^display=true^elementISNOTEMPTY",
+        "element",
+        1,
+        { displayAll: true, excludeRefLinks: true }
+      );
+      displayField = dictionaries.length
+        ? snFieldValue(dictionaries[0], "element").trim()
+        : "";
+      if (displayField) break;
+
+      const tables = await snGetMany(
+        "sys_db_object",
+        "name=" + current,
+        "super_class.name",
+        1,
+        { displayAll: true, excludeRefLinks: true }
+      );
+      current = tables.length
+        ? snFieldValue(tables[0], "super_class.name").trim()
+        : "";
+    }
+  } catch (e) {
+    displayField = "";
+  }
+
+  tableDisplayFieldCache.set(tableName, displayField);
+  return displayField;
+}
+
+function bestDisplayValue(row, preferredField) {
+  const displayFields = [preferredField]
+    .concat(FALLBACK_DISPLAY_FIELDS)
+    .filter((field, index, fields) => field && fields.indexOf(field) === index);
   for (const field of displayFields) {
     const value = snFieldDisplay(row, field);
     if (value && !isSysId(value)) return value;
@@ -810,17 +859,23 @@ async function resolveReferenceDisplayValues(variables, onProgress) {
     }
 
     try {
+      const displayField = await resolveTableDisplayField(table);
+      variable.referenceDisplayField = displayField;
+      const requestedFields = ["sys_id", displayField]
+        .concat(FALLBACK_DISPLAY_FIELDS)
+        .filter((field, fieldIndex, fields) => field && fields.indexOf(field) === fieldIndex)
+        .join(",");
       const rows = await snGetMany(
         table,
         ids.length === 1 ? "sys_id=" + ids[0] : "sys_idIN" + ids.join(","),
-        "sys_id,name,number,display_name,title,short_description,u_name,u_display_name,u_site_name,u_location_name,u_label,street,city,state",
+        requestedFields,
         ids.length,
         { displayAll: true, excludeRefLinks: true }
       );
       const displayById = {};
       rows.forEach((row) => {
         const id = snFieldValue(row, "sys_id");
-        const display = bestDisplayValue(row);
+        const display = bestDisplayValue(row, displayField);
         if (id && display) displayById[id] = display;
       });
 
@@ -832,7 +887,7 @@ async function resolveReferenceDisplayValues(variables, onProgress) {
         });
         broadRows.forEach((row) => {
           const id = snFieldValue(row, "sys_id");
-          const display = bestDisplayValue(row);
+          const display = bestDisplayValue(row, displayField);
           if (id && display) displayById[id] = display;
         });
       }
@@ -1197,6 +1252,7 @@ async function copyPortalVariableDebugInfo() {
         questionId: variable.questionId,
         variableSet: variable.variableSet,
         referenceTable: variable.referenceTable,
+        referenceDisplayField: variable.referenceDisplayField,
         valueLength: variable.value ? String(variable.value).length : 0,
         displayValue: variable.displayValue,
         rowCount: variable.rowCount,
