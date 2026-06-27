@@ -460,11 +460,6 @@ async function fillPortalVariables(variables) {
     return container.querySelector("input.select2-input") || el;
   };
 
-  const isCheckboxVariable = (variable) => {
-    const type = normalizeVariableType((variable && variable.type) || "");
-    return type === "7" || type === "boolean" || type === "checkbox" || type === "checkbox_container";
-  };
-
   const isAttachmentVariable = (variable) => {
     const type = normalizeVariableType((variable && variable.type) || "");
     return type === "33" || type === "attachment";
@@ -507,8 +502,6 @@ async function fillPortalVariables(variables) {
       displayValueLength: variable && variable.displayValue != null ? String(variable.displayValue).length : 0,
     }, details || {}));
   };
-
-  const isDomFirstVariable = (variable) => isCheckboxVariable(variable);
 
   const isChoiceLikeVariable = (variable) => {
     const type = String((variable && variable.type) || "").trim().toLowerCase();
@@ -1541,6 +1534,129 @@ async function fillPortalVariables(variables) {
     return false;
   };
 
+  const isChoiceTarget = (target, variable) => {
+    const type = targetFieldType(target, variable);
+    return (
+      type === "3" ||
+      type === "5" ||
+      type === "18" ||
+      type === "choice" ||
+      type === "multiple_choice" ||
+      type === "select_box"
+    );
+  };
+
+  const isBooleanTarget = (target, variable) => {
+    const type = targetFieldType(target, variable);
+    return (
+      type === "7" ||
+      type === "boolean" ||
+      type === "checkbox" ||
+      type === "checkbox_container"
+    );
+  };
+
+  const isDateTarget = (target, variable) => {
+    const type = targetFieldType(target, variable);
+    return type.indexOf("date") >= 0;
+  };
+
+  const normalizedBooleanValue = (value) =>
+    ["true", "1", "yes", "y", "on"].indexOf(
+      String(value == null ? "" : value).trim().toLowerCase()
+    ) >= 0
+      ? "true"
+      : "false";
+
+  const nativeVariableForTarget = (target, variable) => {
+    const nativeVariable = Object.assign({}, variable);
+    if (isBooleanTarget(target, variable)) {
+      nativeVariable.value = normalizedBooleanValue(variable.value);
+      nativeVariable.displayValue = nativeVariable.value;
+      return nativeVariable;
+    }
+    if (!isChoiceTarget(target, variable)) return nativeVariable;
+
+    const choices =
+      (target && target.field && Array.isArray(target.field.choices)
+        ? target.field.choices
+        : []);
+    const aliasValue = aliasedChoiceValue(variable, variable.value);
+    const match =
+      findChoiceMatch(choices, aliasValue || variable.value, variable.displayValue) ||
+      (aliasValue ? findChoiceMatch(choices, aliasValue, aliasValue) : null);
+    if (match) {
+      nativeVariable.value = String(match.value);
+      nativeVariable.displayValue = String(
+        match.display_value ||
+        match.label ||
+        match.text ||
+        variable.displayValue ||
+        match.value
+      );
+    } else if (aliasValue) {
+      nativeVariable.value = aliasValue;
+    }
+    return nativeVariable;
+  };
+
+  const nativeBooleanDomState = (variable, expected) => {
+    const el = findDomField(variable);
+    if (!el || el.type !== "checkbox") return "unknown";
+    return el.checked === (normalizedBooleanValue(expected) === "true")
+      ? "match"
+      : "mismatch";
+  };
+
+  const nativeStandardValueMatches = (current, target, variable) => {
+    if (isBooleanTarget(target, variable)) {
+      if (isEmpty(current)) return false;
+      return normalizedBooleanValue(current) === normalizedBooleanValue(variable.value);
+    }
+    return sameValue(current, variable.value);
+  };
+
+  const setNativeStandardValue = async (gForm, target, variable) => {
+    if (!gForm || !target || !target.key) return false;
+    const verifyDelay = isChoiceTarget(target, variable)
+      ? choiceFillDelayMs
+      : isBooleanTarget(target, variable)
+        ? 100
+        : Math.max(simpleFillDelayMs, 50);
+
+    const setAndVerify = async (clearFirst) => {
+      try {
+        if (clearFirst) {
+          gForm.setValue(target.key, "");
+          await sleep(simpleFillDelayMs);
+        }
+        gForm.setValue(target.key, variable.value);
+      } catch (e) {
+        return false;
+      }
+
+      for (let attempt = 0; attempt < nativeVerificationAttempts; attempt++) {
+        await sleep(verifyDelay);
+        let current = "";
+        try {
+          current = gForm.getValue(target.key);
+        } catch (e) {}
+        if (!nativeStandardValueMatches(current, target, variable)) continue;
+        if (
+          isBooleanTarget(target, variable) &&
+          nativeBooleanDomState(variable, variable.value) === "mismatch"
+        ) {
+          continue;
+        }
+        return true;
+      }
+      return false;
+    };
+
+    if (await setAndVerify(false)) return true;
+    return isDateTarget(target, variable) ? setAndVerify(true) : false;
+  };
+
   const variableNeedsRefill = (gForm, variable) => {
     const expected = String(variable && variable.value != null ? variable.value : "");
     if (!expected) return false;
@@ -1715,10 +1831,6 @@ async function fillPortalVariables(variables) {
               reason: "native_reference_fallback",
             });
             if (domResult === "filled" || domResult === "already") {
-              if (target) {
-                setGFormValue(gForm, target.key, variable);
-                invokeGFormChangeHandlers(gForm, target.key, variable, current);
-              }
               if (domResult === "filled") {
                 result.filled++;
                 await delayAfterVariableChange(variable);
@@ -1738,23 +1850,73 @@ async function fillPortalVariables(variables) {
           continue;
         }
 
-        const useDomFirst = isDomFirstVariable(variable);
-        if (useDomFirst) {
+        const isComplexVariable =
+          isAttachmentVariable(variable) || isMultiRowVariableSet(variable);
+        if (!isComplexVariable) {
+          const prefix = pass > 1 ? "Retrying" : "Filling";
+          emitProgress(prefix + " " + index + " of " + batch.length + ": " + (variable.label || variable.name));
+          const nativeVariable = nativeVariableForTarget(target, variable);
           try {
-            const prefix = pass > 1 ? "Retrying" : "Filling";
-            emitProgress(prefix + " " + index + " of " + batch.length + ": " + (variable.label || variable.name));
-            const domResult = await fillDomVariable(variable);
-            logFill("dom-first", variable, pass, index, batch.length, domResult);
-            if (domResult === "filled") {
+            let current = "";
+            try {
+              current = target ? gForm.getValue(target.key) : "";
+            } catch (e) {}
+            const alreadyStored =
+              target &&
+              nativeStandardValueMatches(current, target, nativeVariable);
+            const booleanDomState = isBooleanTarget(target, nativeVariable)
+              ? nativeBooleanDomState(variable, nativeVariable.value)
+              : "unknown";
+
+            if (alreadyStored && booleanDomState !== "mismatch") {
+              logFill("native-g_form", variable, pass, index, batch.length, "already", {
+                key: target.key,
+                targetType: targetFieldType(target, nativeVariable),
+                resolvedValue: nativeVariable.value,
+                booleanDomState,
+              });
+              result.alreadySet++;
+              continue;
+            }
+
+            if (await setNativeStandardValue(gForm, target, nativeVariable)) {
+              logFill("native-g_form", variable, pass, index, batch.length, "filled", {
+                key: target && target.key,
+                targetType: targetFieldType(target, nativeVariable),
+                resolvedValue: nativeVariable.value,
+                overwriteExisting: !isEmpty(current),
+              });
               result.filled++;
               await delayAfterVariableChange(variable);
               continue;
             }
-            if (domResult === "already") {
+
+            logFill("native-g_form", variable, pass, index, batch.length, "fallback", {
+              key: target && target.key,
+              targetType: targetFieldType(target, nativeVariable),
+              reason: target ? "native_value_or_widget_not_settled" : "target_field_not_found",
+            });
+            const domResult = await fillDomVariable(nativeVariable);
+            logFill("dom-fallback", variable, pass, index, batch.length, domResult, {
+              reason: "native_standard_fallback",
+              resolvedValue: nativeVariable.value,
+            });
+            if (domResult === "filled") {
+              result.filled++;
+              await delayAfterVariableChange(variable);
+            } else if (domResult === "already") {
               result.alreadySet++;
-              continue;
+            } else {
+              missing.push(variable);
             }
-          } catch (e) {}
+          } catch (e) {
+            logFill("native-g_form", variable, pass, index, batch.length, "error", {
+              error: String(e && e.message ? e.message : e),
+            });
+            if (pass === maxFillPasses) result.skipped++;
+            else missing.push(variable);
+          }
+          continue;
         }
 
         let handled = false;
@@ -1764,7 +1926,7 @@ async function fillPortalVariables(variables) {
             emitProgress(prefix + " " + index + " of " + batch.length + ": " + (variable.label || variable.name));
             const current = gForm.getValue(key);
             if (!isMultiRowVariableSet(variable) && isSameFilledValue(current, variable.value, variable.displayValue)) {
-              if (isKnownAsyncTriggerVariable(variable) || useDomFirst || isReferenceVariable(variable)) {
+              if (isKnownAsyncTriggerVariable(variable) || isReferenceVariable(variable)) {
                 await triggerDomChangeForVariable(variable);
                 setGFormValue(gForm, key, variable);
                 invokeGFormChangeHandlers(gForm, key, variable, current);
