@@ -734,6 +734,58 @@ function isMultiRowVariableSet(variable) {
   return isMultiRowVariableSetType((variable && variable.type) || "");
 }
 
+const UNIQUE_SUPPLIER_NAME_FIELDS = new Set([
+  "supplier_legal_name",
+  "supplier_name",
+]);
+const UNIQUE_SUPPLIER_EMAIL_FIELDS = new Set([
+  "primary_contact_email",
+  "supplier_contact_person_email_address",
+]);
+
+function randomLetterSuffix(length) {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz";
+  const bytes = new Uint8Array(length);
+  try {
+    crypto.getRandomValues(bytes);
+  } catch (e) {
+    for (let index = 0; index < bytes.length; index++) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  return Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join("");
+}
+
+function appendEmailSuffix(value, suffix) {
+  const email = String(value == null ? "" : value);
+  const atIndex = email.indexOf("@");
+  if (atIndex < 0) return email + suffix;
+  return email.slice(0, atIndex) + suffix + email.slice(atIndex);
+}
+
+function uniquifyCopiedSupplierFields(variables) {
+  const matched = Array.from(variables.values()).filter((variable) => {
+    const name = String((variable && variable.name) || "").trim().toLowerCase();
+    return (
+      UNIQUE_SUPPLIER_NAME_FIELDS.has(name) ||
+      UNIQUE_SUPPLIER_EMAIL_FIELDS.has(name)
+    );
+  });
+  if (!matched.length) return;
+
+  const suffix = randomLetterSuffix(5);
+  matched.forEach((variable) => {
+    const name = String(variable.name || "").trim().toLowerCase();
+    const originalValue = String(variable.value == null ? "" : variable.value);
+    if (!originalValue) return;
+    const uniqueValue = UNIQUE_SUPPLIER_EMAIL_FIELDS.has(name)
+      ? appendEmailSuffix(originalValue, suffix)
+      : originalValue + suffix;
+    variable.value = uniqueValue;
+    variable.displayValue = uniqueValue;
+  });
+}
+
 function splitSysIdList(value) {
   return String(value == null ? "" : value)
     .split(",")
@@ -1253,6 +1305,7 @@ async function fetchSourceVariables(source, onProgress) {
   );
   await resolveReferenceDisplayValues(variables, onProgress);
   await resolveAttachmentDisplayValues(variables, onProgress);
+  uniquifyCopiedSupplierFields(variables);
 
   return { variables: sortVariablesForFill(variables), skipped };
 }
