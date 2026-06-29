@@ -15,7 +15,7 @@
   "content_scripts": [
     {
       "matches": ["https://*.service-now.com/*"],
-      "js": ["content.js"],
+      "js": ["debug_timeline_ui.js", "content.js"],
       "all_frames": true,
       "run_at": "document_idle"
     }

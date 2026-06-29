@@ -4,6 +4,8 @@
  * Good place to later add: context menus, cross-tab state, alarms, etc.
  */
 
+importScripts("debug_timeline_main.js");
+
 chrome.commands.onCommand.addListener(async (command) => {
   if (command !== "toggle-field-names") return;
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -2222,6 +2224,83 @@ function inspectPortalVariableDebug() {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg && msg.type === "OPEN_URL" && msg.url) {
     chrome.tabs.create({ url: msg.url });
+  }
+  if (msg && msg.type === "START_DEBUG_TIMELINE" && sender.tab) {
+    chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id, allFrames: true },
+      world: "MAIN",
+      func: startDebugTimelineInPage,
+    }).then((results) => {
+      const frames = results
+        .map((item) => ({
+          frameId: item.frameId,
+          result: item && item.result,
+        }))
+        .filter((item) => item.result && item.result.ok);
+      sendResponse({
+        ok: frames.length > 0,
+        frameCount: frames.length,
+        alreadyActive: frames.length > 0 && frames.every((item) => item.result.alreadyActive),
+        startedAt: frames.reduce(
+          (earliest, item) =>
+            !earliest || item.result.startedAt < earliest ? item.result.startedAt : earliest,
+          0
+        ),
+      });
+    }).catch((error) => {
+      sendResponse({ ok: false, error: String(error) });
+    });
+    return true;
+  }
+  if (msg && msg.type === "STOP_DEBUG_TIMELINE" && sender.tab) {
+    chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id, allFrames: true },
+      world: "MAIN",
+      func: stopDebugTimelineInPage,
+    }).then((results) => {
+      const frames = results
+        .map((item) => ({
+          frameId: item.frameId,
+          result: item && item.result,
+        }))
+        .filter((item) => item.result && item.result.ok && !item.result.notRunning);
+      const startedAt = frames.reduce(
+        (earliest, item) =>
+          !earliest || item.result.startedAt < earliest ? item.result.startedAt : earliest,
+        0
+      );
+      const stoppedAt = frames.reduce(
+        (latest, item) => Math.max(latest, item.result.stoppedAt || 0),
+        Date.now()
+      );
+      const events = [];
+      frames.forEach((frame) => {
+        const frameLabel = frame.frameId === 0 ? "Top frame" : "Frame " + frame.frameId;
+        (frame.result.events || []).forEach((event) => {
+          events.push(Object.assign({}, event, {
+            frameId: frame.frameId,
+            frameLabel,
+            elapsedMs: startedAt ? Math.max(0, event.time - startedAt) : event.elapsedMs,
+          }));
+        });
+      });
+      events.sort((a, b) => {
+        if (a.time !== b.time) return a.time - b.time;
+        if (a.frameId !== b.frameId) return a.frameId - b.frameId;
+        return a.id - b.id;
+      });
+      sendResponse({
+        ok: true,
+        frameCount: frames.length,
+        startedAt,
+        stoppedAt,
+        events,
+        truncated: frames.some((frame) => frame.result.truncated),
+      });
+    }).catch((error) => {
+      sendResponse({ ok: false, error: String(error) });
+    });
+    return true;
   }
   if (
     msg &&

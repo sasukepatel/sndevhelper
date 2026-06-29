@@ -1588,6 +1588,11 @@ const DEV_LINKS = [
 function buildCommands() {
   const navTo = (path) =>
     chrome.runtime.sendMessage({ type: "OPEN_URL", url: location.origin + path });
+  const debugTimeline = globalThis.SNDebugTimelineUI;
+  const debugTimelineRecording =
+    debugTimeline &&
+    typeof debugTimeline.isRecording === "function" &&
+    debugTimeline.isRecording();
   const isPlaybookDefinitionPage = decodedVariants(location.href).some(
     (url) => url.includes("sys_pd_process_definition")
   );
@@ -1608,6 +1613,42 @@ function buildCommands() {
       group: "Tools",
       run: () => broadcastFrameCommand("TOGGLE_TRANSLATIONS"),
     },
+    ...(debugTimelineRecording
+      ? [{
+          id: "stop-debug-timeline",
+          name: "Stop and view debug timeline",
+          keywords: ["debug", "timeline", "trace", "record", "g_form", "glideajax", "error"],
+          group: "Tools",
+          keepOpen: true,
+          run: async () => {
+            if (!debugTimeline || typeof debugTimeline.stopAndView !== "function") {
+              throw new Error("Debug Timeline UI is unavailable.");
+            }
+            await debugTimeline.stopAndView();
+            closePalette();
+          },
+        }]
+      : [{
+          id: "start-debug-timeline",
+          name: "Start debug timeline",
+          keywords: ["debug", "timeline", "trace", "record", "g_form", "glideajax", "error"],
+          group: "Tools",
+          keepOpen: true,
+          run: async () => {
+            if (!debugTimeline || typeof debugTimeline.start !== "function") {
+              throw new Error("Debug Timeline UI is unavailable.");
+            }
+            showToast("Starting Debug Timeline...", false, 6000);
+            const response = await debugTimeline.start();
+            showToast(
+              "Recording across " + (response.frameCount || 1) + " frame" +
+                ((response.frameCount || 1) === 1 ? "" : "s"),
+              false,
+              1200
+            );
+            setTimeout(closePalette, 450);
+          },
+        }]),
     {
       id: "copy-sysid",
       name: "Copy sys_id",

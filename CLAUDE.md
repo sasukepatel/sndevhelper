@@ -41,6 +41,10 @@ the caller falls back gracefully.
 - `manifest.json` — MV3 config, permissions, content scripts, command.
 - `content.js` — isolated world: field-name badges, translation icons,
   dictionary-inheritance resolution, Table API helper (`snGet`).
+- `debug_timeline_ui.js` - isolated-world recording indicator and filterable
+  Debug Timeline results panel.
+- `debug_timeline_main.js` - MAIN-world Debug Timeline recorder imported by
+  the service worker and injected into every frame on demand.
 - `popup.js` / `popup.html` / `popup.css` — popup UI: instance info, quick table
   open, dev links, copy sys_id, toggles.
 - `background.js` — service worker: keyboard command + `OPEN_URL` handler.
@@ -54,6 +58,11 @@ the caller falls back gracefully.
     filtered by `documentkey=<record sys_id>^fieldname=<field>` when a record is
     open, else `tablename^fieldname`.
 - **Field-name badges** parse the classic label id format `label.<table>.<field>`.
+- **Debug Timeline** is a best-effort, single-page interaction recorder for
+  public `g_form` calls, native field events, GlideAjax timing, and JavaScript
+  errors. It does not promise named Client Script or UI Policy attribution.
+  MAIN-world patches must remain reversible and traces must stay capped and
+  redact fields or parameters whose names indicate secrets.
 
 ## Conventions & constraints
 - **IMPORTANT — Never delete a branch from GitHub or any Git remote.** Remote
