@@ -14,6 +14,9 @@
   let lastResult = null;
   let activeFilter = "all";
   let searchQuery = "";
+  let showLowSignal = false;
+  let lowSignalReasons = new WeakMap();
+  let lowSignalCount = 0;
 
   const CATEGORY_LABELS = {
     system: "System",
@@ -86,6 +89,8 @@
     .filters{display:flex;gap:6px;flex-wrap:wrap}
     .filter{padding:5px 9px;font-size:11px;color:#9898b2}
     .filter.active{background:#373766;border-color:#6262a1;color:#fff}
+    .filter.low-signal-toggle{color:#85859a;border-color:#343449;background:#242437}
+    .filter.low-signal-toggle.active{color:#b8b8cb;border-color:#4b4b65;background:#303047}
     .search{
       margin-left:auto;width:230px;max-width:38vw;background:#151522;
       border:1px solid #353553;border-radius:6px;color:#e5e5f4;
@@ -109,7 +114,25 @@
     .category.error{color:#ffb1b1;background:#432a36;border-color:#684050}
     .category.glideajax{color:#a9d5ff;background:#24364a;border-color:#365573}
     .category.field{color:#b5e4c2;background:#263b35;border-color:#39594d}
-    .event-summary{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .event-summary{min-width:0;display:flex;align-items:center;gap:8px;font-size:12px}
+    .event-summary-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .glideajax-status{
+      flex:0 0 auto;padding:2px 6px;border-radius:4px;font-size:9px;
+      font-weight:700;letter-spacing:.03em;text-transform:uppercase;
+    }
+    .glideajax-status.started{
+      color:#a9d5ff;background:#24364a;border:1px solid #365573;
+    }
+    .glideajax-status.completed{
+      color:#b5e4c2;background:#263b35;border:1px solid #39594d;
+    }
+    .event.low-signal .event-main{color:#9999ad}
+    .event.low-signal .category{opacity:.62}
+    .low-signal-badge{
+      flex:0 0 auto;padding:2px 6px;border-radius:999px;font-size:9px;
+      color:#85859a;background:#242437;border:1px solid #38384d;
+      letter-spacing:.02em;
+    }
     .expand{color:#6f6f86;font-size:11px}
     .event-details{
       display:none;margin:0 18px 12px 186px;padding:10px 12px;
@@ -191,9 +214,53 @@
       .join(" ")
       .toLowerCase();
 
+  const classifyLowSignalEvents = (events) => {
+    const repeatableMethods = new Set([
+      "hideFieldMsg",
+      "setMandatory",
+      "setVisible",
+      "setDisplay",
+      "setReadOnly",
+      "setDisabled",
+    ]);
+    const latestCalls = new Map();
+    lowSignalReasons = new WeakMap();
+    lowSignalCount = 0;
+
+    events.forEach((event) => {
+      const details = event.details || {};
+      let reason = details.noValueChange ? "No value change" : "";
+
+      if (event.category === "g_form" && repeatableMethods.has(event.action)) {
+        const key = [
+          event.frameId,
+          event.action,
+          details.field || "",
+        ].join("|");
+        const signature = JSON.stringify(details.arguments || []);
+        const previous = latestCalls.get(key);
+        if (
+          !reason &&
+          previous &&
+          previous.signature === signature &&
+          event.time - previous.time <= 5000
+        ) {
+          reason = "Repeated call";
+        }
+        latestCalls.set(key, { signature, time: event.time });
+      }
+
+      if (reason) {
+        lowSignalReasons.set(event, reason);
+        lowSignalCount += 1;
+      }
+    });
+  };
+
   const filteredEvents = () => {
     const events = (lastResult && lastResult.events) || [];
     return events.filter((event) => {
+      if (!showLowSignal && lowSignalReasons.has(event)) return false;
       if (activeFilter !== "all" && event.category !== activeFilter) return false;
       return !searchQuery || eventSearchText(event).includes(searchQuery);
     });
@@ -227,6 +294,8 @@
     events.forEach((event) => {
       const row = document.createElement("div");
       row.className = "event";
+      const lowSignalReason = lowSignalReasons.get(event) || "";
+      if (lowSignalReason) row.classList.add("low-signal");
 
       const main = document.createElement("button");
       main.type = "button";
@@ -242,8 +311,28 @@
 
       const summary = document.createElement("span");
       summary.className = "event-summary";
-      summary.textContent = event.summary || event.action || "Timeline event";
-      summary.title = summary.textContent;
+      if (
+        event.category === "glideajax" &&
+        (event.action === "start" || event.action === "complete")
+      ) {
+        const status = document.createElement("span");
+        status.className =
+          "glideajax-status " +
+          (event.action === "start" ? "started" : "completed");
+        status.textContent = event.action === "start" ? "Started" : "Completed";
+        summary.appendChild(status);
+      }
+      const summaryText = document.createElement("span");
+      summaryText.className = "event-summary-text";
+      summaryText.textContent = event.summary || event.action || "Timeline event";
+      summary.title = summaryText.textContent;
+      summary.appendChild(summaryText);
+      if (lowSignalReason) {
+        const badge = document.createElement("span");
+        badge.className = "low-signal-badge";
+        badge.textContent = lowSignalReason;
+        summary.appendChild(badge);
+      }
 
       const expand = document.createElement("span");
       expand.className = "expand";
@@ -286,6 +375,9 @@
           (event.summary || event.action || "")
       );
       if (event.frameLabel) lines.push("  Frame: " + event.frameLabel);
+      if (lowSignalReasons.has(event)) {
+        lines.push("  Signal: " + lowSignalReasons.get(event));
+      }
       if (event.details && Object.keys(event.details).length) {
         lines.push("  Details: " + JSON.stringify(event.details));
       }
@@ -336,6 +428,8 @@
     lastResult = result;
     activeFilter = "all";
     searchQuery = "";
+    showLowSignal = false;
+    classifyLowSignalEvents(result.events || []);
 
     resultsHost = document.createElement("div");
     resultsHost.id = "snh-debug-timeline-results";
@@ -365,6 +459,7 @@
               <button class="filter" type="button" data-filter="field">Fields</button>
               <button class="filter" type="button" data-filter="glideajax">GlideAjax</button>
               <button class="filter" type="button" data-filter="error">Errors</button>
+              <button class="filter low-signal-toggle" type="button" data-action="toggle-low-signal" aria-pressed="false">Show low-signal (${lowSignalCount})</button>
             </div>
             <input class="search" type="search" placeholder="Search events, fields, stacks…" aria-label="Search timeline" />
           </div>
@@ -398,6 +493,19 @@
         renderEvents();
       });
     });
+
+    const lowSignalToggle = resultsShadow.querySelector("[data-action='toggle-low-signal']");
+    if (lowSignalToggle) {
+      lowSignalToggle.hidden = lowSignalCount === 0;
+      lowSignalToggle.addEventListener("click", () => {
+        showLowSignal = !showLowSignal;
+        lowSignalToggle.classList.toggle("active", showLowSignal);
+        lowSignalToggle.setAttribute("aria-pressed", String(showLowSignal));
+        lowSignalToggle.textContent =
+          (showLowSignal ? "Hide" : "Show") + " low-signal (" + lowSignalCount + ")";
+        renderEvents();
+      });
+    }
 
     const search = resultsShadow.querySelector(".search");
     if (search) {

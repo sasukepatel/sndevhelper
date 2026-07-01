@@ -65,6 +65,24 @@ function startDebugTimelineInPage() {
     }
   };
 
+  const formValuesMatch = (currentValue, requestedValue) => {
+    const normalize = (value) => {
+      if (value == null) return "";
+      if (Array.isArray(value)) return value.map((item) => String(item)).join(",");
+      if (
+        typeof value === "string" ||
+        typeof value === "number" ||
+        typeof value === "boolean"
+      ) {
+        return String(value);
+      }
+      return null;
+    };
+    const current = normalize(currentValue);
+    const requested = normalize(requestedValue);
+    return current !== null && requested !== null && current === requested;
+  };
+
   const captureStack = () => {
     try {
       return String(new Error().stack || "")
@@ -173,10 +191,12 @@ function startDebugTimelineInPage() {
         return function (...args) {
           const fieldName = String(args[0] == null ? "" : args[0]);
           const stack = captureStack();
+          let comparableOldValue;
           let oldValue;
           if (fieldName && typeof this.getValue === "function") {
             try {
-              oldValue = safeValue(this.getValue(fieldName), fieldName);
+              comparableOldValue = this.getValue(fieldName);
+              oldValue = safeValue(comparableOldValue, fieldName);
             } catch (e) {}
           }
 
@@ -187,6 +207,13 @@ function startDebugTimelineInPage() {
               arguments: args.slice(1, 6).map((arg) => safeValue(arg, fieldName)),
             };
             if (oldValue !== undefined) details.oldValue = oldValue;
+            if (
+              methodName === "setValue" &&
+              oldValue !== undefined &&
+              formValuesMatch(comparableOldValue, args[1])
+            ) {
+              details.noValueChange = true;
+            }
             addEvent(
               "g_form",
               methodName,
@@ -393,6 +420,73 @@ function startDebugTimelineInPage() {
     };
   };
 
+  const sanitizeGlideAjaxResponseValue = (value, key, depth) => {
+    if (sensitivePattern.test(String(key || ""))) return "[REDACTED]";
+    if (depth > 6) return "[MAX DEPTH]";
+    if (value == null || typeof value === "number" || typeof value === "boolean") {
+      return value;
+    }
+    if (typeof value === "string") return truncate(value, 4000);
+    if (Array.isArray(value)) {
+      return value
+        .slice(0, 50)
+        .map((item) => sanitizeGlideAjaxResponseValue(item, "", depth + 1));
+    }
+    if (typeof value === "object") {
+      const sanitized = {};
+      Object.keys(value)
+        .slice(0, 50)
+        .forEach((property) => {
+          sanitized[property] = sanitizeGlideAjaxResponseValue(
+            value[property],
+            property,
+            depth + 1
+          );
+        });
+      return sanitized;
+    }
+    return truncate(value, 4000);
+  };
+
+  const glideAjaxResponseInfo = (response) => {
+    let answer;
+    let status;
+    try {
+      if (typeof response === "string") {
+        answer = response;
+      } else if (response) {
+        if (typeof response.status === "number") status = response.status;
+        const responseXml =
+          response.responseXML ||
+          (response.documentElement ? response : null);
+        const root = responseXml && responseXml.documentElement;
+        if (root && typeof root.getAttribute === "function") {
+          answer = root.getAttribute("answer");
+        }
+      }
+    } catch (e) {}
+
+    const result = {};
+    if (status !== undefined) result.status = status;
+    if (answer !== undefined && answer !== null) {
+      const answerText = String(answer);
+      result.answerLength = answerText.length;
+      result.truncated = answerText.length > 4000;
+      try {
+        result.answer = sanitizeGlideAjaxResponseValue(
+          JSON.parse(answerText),
+          "",
+          0
+        );
+        result.format = "json";
+      } catch (e) {
+        result.answer = truncate(answerText, 4000);
+        result.format = "text";
+      }
+    }
+    return Object.keys(result).length ? result : null;
+  };
+
   const patchGlideAjax = () => {
     let prototype;
     try {
@@ -424,15 +518,22 @@ function startDebugTimelineInPage() {
         if (typeof args[0] === "function") {
           const callback = args[0];
           args[0] = function (...callbackArgs) {
+            const durationMs = Date.now() - started;
+            const response = glideAjaxResponseInfo(callbackArgs[0]);
             addEvent(
               "glideajax",
               "complete",
               info.className +
                 (info.method ? "." + info.method : "") +
                 " completed in " +
-                (Date.now() - started) +
+                durationMs +
                 " ms",
-              Object.assign({}, info, { durationMs: Date.now() - started }),
+              Object.assign(
+                {},
+                info,
+                { durationMs },
+                response ? { response } : {}
+              ),
               ""
             );
             return callback.apply(this, callbackArgs);
@@ -464,15 +565,27 @@ function startDebugTimelineInPage() {
         const stack = captureStack();
         try {
           const result = original.apply(this, args);
+          const durationMs = Date.now() - started;
+          let response = glideAjaxResponseInfo(result);
+          if (!response && typeof this.getAnswer === "function") {
+            try {
+              response = glideAjaxResponseInfo(this.getAnswer());
+            } catch (e) {}
+          }
           addEvent(
             "glideajax",
             "complete",
-            info.className +
-              (info.method ? "." + info.method : "") +
-              " completed synchronously in " +
-              (Date.now() - started) +
-              " ms",
-            Object.assign({}, info, { durationMs: Date.now() - started }),
+              info.className +
+                (info.method ? "." + info.method : "") +
+                " completed synchronously in " +
+                durationMs +
+                " ms",
+            Object.assign(
+              {},
+              info,
+              { durationMs },
+              response ? { response } : {}
+            ),
             stack
           );
           return result;
@@ -540,7 +653,6 @@ function startDebugTimelineInPage() {
 
   state.restore = restore;
   state.stop = () => {
-    addEvent("system", "stop", "Recording stopped", {}, "");
     const result = {
       ok: true,
       active: false,
@@ -555,7 +667,6 @@ function startDebugTimelineInPage() {
     return result;
   };
 
-  addEvent("system", "start", "Recording started", {}, "");
   return {
     ok: true,
     alreadyActive: false,

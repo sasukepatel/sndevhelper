@@ -2296,11 +2296,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }));
         });
       });
+      if (frames.length && startedAt) {
+        events.push(
+          {
+            id: 0,
+            time: startedAt,
+            elapsedMs: 0,
+            category: "system",
+            action: "start",
+            summary: "Recording started",
+            details: { frameCount: frames.length },
+            stack: "",
+            sessionEventOrder: -1,
+          },
+          {
+            id: 0,
+            time: stoppedAt,
+            elapsedMs: Math.max(0, stoppedAt - startedAt),
+            category: "system",
+            action: "stop",
+            summary: "Recording stopped",
+            details: { frameCount: frames.length },
+            stack: "",
+            sessionEventOrder: 1,
+          }
+        );
+      }
       events.sort((a, b) => {
         if (a.time !== b.time) return a.time - b.time;
+        if (a.sessionEventOrder !== b.sessionEventOrder) {
+          return (a.sessionEventOrder || 0) - (b.sessionEventOrder || 0);
+        }
         if (a.frameId !== b.frameId) return a.frameId - b.frameId;
         return a.id - b.id;
       });
+      events.forEach((event) => delete event.sessionEventOrder);
       sendResponse({
         ok: true,
         frameCount: frames.length,
