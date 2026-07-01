@@ -69,6 +69,11 @@ the caller falls back gracefully.
   branches must remain intact after merges and during cleanup. Cleanup may
   delete a local branch only; it must never use `git push --delete`, GitHub's
   branch deletion controls, or any equivalent remote-branch deletion action.
+- When the user asks to deploy, publish, or push a feature branch to GitHub and
+  switch back to `main`, complete the full workflow: validate and commit the
+  branch, push it, open a pull request to `main`, merge and verify the pull
+  request, then fetch and fast-forward local `main`. Do not treat a successful
+  branch push alone as deployment, and preserve the remote feature branch.
 - Name new branches `YYYYMMDD-NN-category-description`, using the current
   Europe/London date, a two-digit sequence starting at `01` for that date, and
   lowercase kebab-case. Before creating a branch, inspect local and remote
